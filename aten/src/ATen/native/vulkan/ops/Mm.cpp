@@ -292,13 +292,13 @@ vTensor pack_biases_quantized_weights(
 bool available_check_with_batch(
     const Tensor& weight,
     const std::optional<Tensor>& bias) {
-  const bool weight_available = (3 == weight.ndimension()) &&
+    const bool weight_available = (3 == weight.ndimension()) &&
       (weight.size(Layout::BatchMatrices::batch) > 0) &&
       (weight.size(Layout::BatchMatrices::height) > 0) &&
       (weight.size(Layout::BatchMatrices::width) > 0) &&
       ((weight.device().is_cpu()) ||
        (c10::DeviceType::Vulkan == weight.device().type())) &&
-      (kFloat == weight.scalar_type()) && !weight.requires_grad();
+      (kFloat == weight.scalar_type());
   if (!weight_available) {
     return false;
   }
