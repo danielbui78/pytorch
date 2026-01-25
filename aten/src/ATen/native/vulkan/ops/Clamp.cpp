@@ -1,6 +1,12 @@
 #include <ATen/native/vulkan/ops/Common.h>
 #include <torch/library.h>
 
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#else
+#include <ATen/ops/gelu_backward.h>
+#endif
+
 namespace at {
 namespace native {
 namespace vulkan {
@@ -541,6 +547,16 @@ Tensor& gelu_(Tensor& self, std::string_view approximate) {
   return ops::activation_scalar_(self, scalar, VK_KERNEL(gelu_tanh_));
 }
 
+Tensor gelu_backward(
+    const Tensor& grad_output,
+    const Tensor& self,
+    std::string_view approximate) {
+  const Tensor grad_cpu = grad_output.is_vulkan() ? grad_output.cpu() : grad_output;
+  const Tensor self_cpu = self.is_vulkan() ? self.cpu() : self;
+  Tensor out_cpu = at::gelu_backward(grad_cpu, self_cpu, approximate);
+  return out_cpu.to(at::kVulkan);
+}
+
 Tensor hardshrink(const Tensor& self_arg, const Scalar& lambd) {
   float abs_lambd = std::abs(lambd.to<float>());
   std::vector<Scalar> scalar;
@@ -598,6 +614,7 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(TORCH_SELECTIVE_NAME("aten::clamp_"), TORCH_FN(clamp_));
   m.impl(TORCH_SELECTIVE_NAME("aten::gelu"), gelu);
   m.impl(TORCH_SELECTIVE_NAME("aten::gelu_"), gelu_);
+  m.impl(TORCH_SELECTIVE_NAME("aten::gelu_backward"), gelu_backward);
   m.impl(TORCH_SELECTIVE_NAME("aten::hardsigmoid"), hardsigmoid);
   m.impl(TORCH_SELECTIVE_NAME("aten::hardsigmoid_"), hardsigmoid_);
   m.impl(TORCH_SELECTIVE_NAME("aten::hardshrink"), hardshrink);

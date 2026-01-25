@@ -339,7 +339,6 @@ bool available_check_with_batch(
              weight.size(Layout::BatchMatrices::width) ||
          bias->size(Layout::BatchMatrices::batch) == 1);
   }
-  bias_available &= !bias->requires_grad();
   return bias_available;
 }
 
@@ -360,8 +359,7 @@ bool available(
       (weight.size(Layout::Parameter::width) > 0) &&
       ((weight.device().is_cpu()) ||
        (c10::DeviceType::Vulkan == weight.device().type())) &&
-      (kFloat == weight.scalar_type() || kQInt8 == weight.scalar_type()) &&
-      !weight.requires_grad();
+      (kFloat == weight.scalar_type() || kQInt8 == weight.scalar_type());
   if (!weight_available) {
     return false;
   }
@@ -371,12 +369,11 @@ bool available(
            ? ((bias->ndimension() > 0) &&
               ((bias->device().is_cpu()) ||
                (c10::DeviceType::Vulkan == bias->device().type())) &&
-              (kFloat == bias->scalar_type()) &&
-              ((bias->ndimension() > 1)
+                (kFloat == bias->scalar_type()) &&
+                ((bias->ndimension() > 1)
                    ? (bias->size(Layout::Parameter::width) ==
-                      weight.size(Layout::Parameter::width))
-                   : true) &&
-              !bias->requires_grad())
+                     weight.size(Layout::Parameter::width))
+                   : true))
            : true);
   return bias_available;
 }
@@ -390,8 +387,7 @@ bool usable_check_with_batch(
       (input.size(Layout::BatchMatrices::width) ==
        unpacked_weight_sizes[Layout::BatchMatrices::height]) &&
       (input.size(Layout::BatchMatrices::batch) ==
-       unpacked_weight_sizes[Layout::BatchMatrices::batch]) &&
-      !input.requires_grad() && true;
+       unpacked_weight_sizes[Layout::BatchMatrices::batch]) && true;
 }
 
 bool usable(
@@ -408,8 +404,7 @@ bool usable(
        (v_input.is_quantized() &&
         (kQUInt8 == input.scalar_type() || kQInt8 == input.scalar_type()))) &&
       (input.size(Layout::Parameter::width) ==
-       unpacked_weight_sizes[Layout::Parameter::height]) &&
-      !input.requires_grad() && true;
+       unpacked_weight_sizes[Layout::Parameter::height]) && true;
 }
 
 static Tensor reshape_to_2d(const Tensor& input_arg) {
