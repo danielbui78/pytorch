@@ -11,6 +11,7 @@
 #include <ATen/Functions.h>
 #else
 #include <ATen/ops/native_layer_norm.h>
+#include <ATen/ops/native_layer_norm_backward.h>
 #endif
 
 namespace at {
@@ -92,10 +93,63 @@ static Tensor layer_norm(
           LayernormPackedContext(weight_opt, bias_opt, eps)));
 }
 
+std::tuple<Tensor, Tensor, Tensor> native_layer_norm_backward(
+    const Tensor& grad_out,
+    const Tensor& input,
+    IntArrayRef normalized_shape,
+    const Tensor& mean,
+    const Tensor& rstd,
+    const std::optional<Tensor>& weight,
+    const std::optional<Tensor>& bias,
+    std::array<bool, 3> output_mask) {
+  const Tensor grad_cpu = grad_out.is_vulkan() ? grad_out.cpu() : grad_out;
+  const Tensor input_cpu = input.is_vulkan() ? input.cpu() : input;
+  const Tensor mean_cpu = mean.is_vulkan() ? mean.cpu() : mean;
+  const Tensor rstd_cpu = rstd.is_vulkan() ? rstd.cpu() : rstd;
+  const std::optional<Tensor> weight_cpu =
+      (weight && weight->is_vulkan()) ? std::optional<Tensor>(weight->cpu())
+                                      : weight;
+  const std::optional<Tensor> bias_cpu =
+      (bias && bias->is_vulkan()) ? std::optional<Tensor>(bias->cpu())
+                                   : bias;
+
+  auto grads = at::native_layer_norm_backward(
+      grad_cpu,
+      input_cpu,
+      normalized_shape,
+      mean_cpu,
+      rstd_cpu,
+      weight_cpu,
+      bias_cpu,
+      output_mask);
+
+  Tensor grad_input = std::get<0>(grads);
+  Tensor grad_weight = std::get<1>(grads);
+  Tensor grad_bias = std::get<2>(grads);
+
+  if (output_mask[0] && grad_input.defined()) {
+    grad_input = grad_input.to(at::kVulkan);
+  }
+  if (output_mask[1] && grad_weight.defined()) {
+    grad_weight = grad_weight.to(at::kVulkan);
+  }
+  if (output_mask[2] && grad_bias.defined()) {
+    grad_bias = grad_bias.to(at::kVulkan);
+  }
+
+  return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
+// NOTE: We intentionally do not register aten::layer_norm for Vulkan here.
+// This avoids CompositeImplicitAutograd dispatch ambiguity and allows
+// composite lowering to select Vulkan-supported primitives.
+
 #ifdef USE_VULKAN_API
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
-  m.impl(TORCH_SELECTIVE_NAME("aten::layer_norm"), TORCH_FN(layer_norm));
+  m.impl(
+      TORCH_SELECTIVE_NAME("aten::native_layer_norm_backward"),
+      TORCH_FN(native_layer_norm_backward));
 }
 
 #endif /* USE_VULKAN_API */
