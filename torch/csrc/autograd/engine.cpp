@@ -65,7 +65,8 @@ static void track_bad_autograd_forks() {
 }
 
 inline bool should_run_in_cpu_ready_queue(c10::DeviceType device) {
-  if (device == c10::kCPU || device == c10::kMeta || device == c10::kLazy) {
+  if (device == c10::kCPU || device == c10::kMeta || device == c10::kLazy ||
+      device == c10::kVulkan) {
     return true;
   } else {
     return false;

@@ -23,6 +23,12 @@ namespace at::native {
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ fill ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Tensor& fill_out(Tensor& self, const Scalar& value) {
+  if (self.is_vulkan()) {
+    auto cpu = at::empty_like(self, self.options().device(at::kCPU));
+    cpu.fill_(value);
+    self.copy_(cpu);
+    return self;
+  }
   if (self.device() == at::kCPU && self.numel() == 1) {
     return at::detail::scalar_fill(self, value);
   }

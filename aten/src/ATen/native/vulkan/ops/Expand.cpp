@@ -22,8 +22,14 @@ Tensor expand(
     const at::Tensor& self,
     const IntArrayRef output_size,
     bool implicit = false) {
+  if (self.dim() == 0) {
+    if (output_size.size() == 0) {
+      return self;
+    }
+    return self.reshape({1}).expand(output_size);
+  }
   TORCH_CHECK(
-      self.dim() > 0 && self.dim() <= 4,
+      self.dim() <= 4,
       "Vulkan expand supports up to 4d tensors");
   TORCH_CHECK(
       static_cast<size_t>(self.dim()) <= output_size.size(),

@@ -2,6 +2,12 @@
 #include <ATen/native/vulkan/ops/Utils.h>
 #include <torch/library.h>
 
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#else
+#include <ATen/ops/empty_like.h>
+#endif
+
 namespace at {
 namespace native {
 namespace vulkan {
@@ -82,11 +88,19 @@ Tensor zeros(
   return convert(v_output);
 }
 
+Tensor& fill_scalar(Tensor& self, const Scalar& value) {
+  auto cpu = at::empty_like(self, self.options().device(at::kCPU));
+  cpu.fill_(value);
+  self.copy_(cpu);
+  return self;
+}
+
 #ifdef USE_VULKAN_API
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(TORCH_SELECTIVE_NAME("aten::zero_"), TORCH_FN(zero_));
   m.impl(TORCH_SELECTIVE_NAME("aten::zeros"), TORCH_FN(zeros));
+  m.impl(TORCH_SELECTIVE_NAME("aten::fill_.Scalar"), TORCH_FN(fill_scalar));
 }
 
 #endif /* USE_VULKAN_API */
