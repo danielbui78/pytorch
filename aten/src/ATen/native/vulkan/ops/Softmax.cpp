@@ -250,6 +250,7 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl("_softmax", TORCH_FN(softmax));
   m.impl("_log_softmax", TORCH_FN(log_softmax));
   m.impl("_softmax_backward_data", TORCH_FN(softmax_backward_data));
+  m.impl("_softmax_backward_data.out", TORCH_FN(softmax_backward_data_out));
 }
 
 #endif /* USE_VULKAN_API */
