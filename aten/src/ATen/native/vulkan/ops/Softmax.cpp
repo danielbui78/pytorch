@@ -225,11 +225,11 @@ Tensor softmax_backward_data(
 }
 
 Tensor& softmax_backward_data_out(
-    Tensor& grad_input,
-    const Tensor& grad_output_arg,
-    const Tensor& output_arg,
-    const int64_t dim,
-    const ScalarType input_dtype) {
+  const Tensor& grad_output_arg,
+  const Tensor& output_arg,
+  const int64_t dim,
+  const ScalarType input_dtype,
+  Tensor& grad_input) {
   const Tensor grad_output_cpu =
       grad_output_arg.is_vulkan() ? grad_output_arg.cpu() : grad_output_arg;
   const Tensor output_cpu =
