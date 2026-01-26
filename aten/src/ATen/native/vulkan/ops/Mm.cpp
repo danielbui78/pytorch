@@ -907,6 +907,19 @@ Tensor bmm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
           mat2_arg, std::optional<Tensor>(), true /*use batch*/)));
 }
 
+Tensor matmul(const Tensor& mat1_arg, const Tensor& mat2_arg) {
+  if (mat1_arg.dim() == 2 && mat2_arg.dim() == 2) {
+    return mm(mat1_arg, mat2_arg);
+  }
+  if (mat1_arg.dim() == 3 && mat2_arg.dim() == 3) {
+    return bmm(mat1_arg, mat2_arg);
+  }
+
+  const Tensor mat1_cpu = mat1_arg.is_vulkan() ? mat1_arg.cpu() : mat1_arg;
+  const Tensor mat2_cpu = mat2_arg.is_vulkan() ? mat2_arg.cpu() : mat2_arg;
+  return at::matmul(mat1_cpu, mat2_cpu).to(at::kVulkan);
+}
+
 Tensor baddbmm(
     const Tensor& bias,
     const Tensor& input,
@@ -928,6 +941,7 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(TORCH_SELECTIVE_NAME("aten::mm"), TORCH_FN(mm));
   m.impl(TORCH_SELECTIVE_NAME("aten::bmm"), TORCH_FN(bmm));
   m.impl(TORCH_SELECTIVE_NAME("aten::baddbmm"), TORCH_FN(baddbmm));
+  m.impl(TORCH_SELECTIVE_NAME("aten::matmul"), TORCH_FN(matmul));
 }
 
 #endif /* USE_VULKAN_API */
