@@ -909,10 +909,10 @@ Tensor bmm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
 
 Tensor matmul(const Tensor& mat1_arg, const Tensor& mat2_arg) {
   if (mat1_arg.dim() == 2 && mat2_arg.dim() == 2) {
-    return mm(mat1_arg, mat2_arg);
+    return ::at::native::vulkan::ops::mm(mat1_arg, mat2_arg);
   }
   if (mat1_arg.dim() == 3 && mat2_arg.dim() == 3) {
-    return bmm(mat1_arg, mat2_arg);
+    return ::at::native::vulkan::ops::bmm(mat1_arg, mat2_arg);
   }
 
   const Tensor mat1_cpu = mat1_arg.is_vulkan() ? mat1_arg.cpu() : mat1_arg;
