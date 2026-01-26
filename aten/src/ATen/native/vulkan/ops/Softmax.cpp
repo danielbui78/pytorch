@@ -230,12 +230,16 @@ Tensor& softmax_backward_data_out(
     const Tensor& output_arg,
     const int64_t dim,
     const ScalarType input_dtype) {
-  const Tensor grad_input_vulkan =
-      softmax_backward_data(grad_output_arg, output_arg, dim, input_dtype);
+  const Tensor grad_output_cpu =
+      grad_output_arg.is_vulkan() ? grad_output_arg.cpu() : grad_output_arg;
+  const Tensor output_cpu =
+      output_arg.is_vulkan() ? output_arg.cpu() : output_arg;
+  const Tensor grad_input_cpu =
+      at::_softmax_backward_data(grad_output_cpu, output_cpu, dim, input_dtype);
   if (grad_input.is_vulkan()) {
-    grad_input.copy_(grad_input_vulkan);
+    grad_input.copy_(grad_input_cpu.to(at::kVulkan));
   } else {
-    grad_input.copy_(grad_input_vulkan.cpu());
+    grad_input.copy_(grad_input_cpu);
   }
   return grad_input;
 }
