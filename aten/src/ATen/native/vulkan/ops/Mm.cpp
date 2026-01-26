@@ -941,7 +941,6 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(TORCH_SELECTIVE_NAME("aten::mm"), TORCH_FN(mm));
   m.impl(TORCH_SELECTIVE_NAME("aten::bmm"), TORCH_FN(bmm));
   m.impl(TORCH_SELECTIVE_NAME("aten::baddbmm"), TORCH_FN(baddbmm));
-  m.impl(TORCH_SELECTIVE_NAME("aten::matmul"), TORCH_FN(matmul));
 }
 
 #endif /* USE_VULKAN_API */
