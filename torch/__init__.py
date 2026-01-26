@@ -226,6 +226,9 @@ if sys.platform == "win32":
         dll_paths.extend(
             p for p in (nvtoolsext_dll_path, cuda_path) if os.path.exists(p)
         )
+        system32_path = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32")
+        if os.path.exists(system32_path):
+            dll_paths.append(system32_path)
 
         kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
         with_load_library_flags = hasattr(kernel32, "AddDllDirectory")
@@ -254,8 +257,22 @@ if sys.platform == "win32":
             )
 
         dlls = glob.glob(os.path.join(th_dll_path, "*.dll"))
+        skip_aoti_custom_ops = os.getenv("TORCH_SKIP_AOTI_CUSTOM_OPS")
+        skip_optional_dlls = os.getenv("TORCH_SKIP_OPTIONAL_DLLS")
+        optional_dll_names = {
+            "aoti_custom_ops.dll",
+            "backend_with_compiler.dll",
+            "jitbackend_test.dll",
+            "shm.dll",
+            "torchbind_test.dll",
+        }
         path_patched = False
         for dll in dlls:
+            dll_name = os.path.basename(dll).lower()
+            if skip_aoti_custom_ops and dll_name == "aoti_custom_ops.dll":
+                continue
+            if skip_optional_dlls and dll_name in optional_dll_names:
+                continue
             is_loaded = False
             if with_load_library_flags:
                 res = kernel32.LoadLibraryExW(dll, None, 0x00001100)
