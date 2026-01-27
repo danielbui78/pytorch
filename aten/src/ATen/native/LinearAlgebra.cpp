@@ -2079,14 +2079,20 @@ static Tensor _matmul_impl(
     const auto t1_folded = t1->reshape({folded_dim1, sizes_1.back()});
     if (!has_out) {
       if (t2_is_matrix) {
-        const auto output = at::_unsafe_view(t1_folded.mm(*t2), output_shape);
+        const auto output_mm = t1_folded.mm(*t2);
+        const auto output = output_mm.is_vulkan()
+            ? output_mm.reshape(output_shape)
+            : at::_unsafe_view(output_mm, output_shape);
         // This copies if we perform a 2D @ 3D and the first tensor requires_grad
         // See should_fold for why.
         // If mm_out were differentiable, we could use it here, and pass a result with the
         // correct strides to avoid this unnecessary copy.
         return transpose ? output.mT().contiguous() : output;
       } else {
-        return at::_unsafe_view(t1_folded.mv(*t2), output_shape);
+        const auto output_mv = t1_folded.mv(*t2);
+        return output_mv.is_vulkan()
+            ? output_mv.reshape(output_shape)
+            : at::_unsafe_view(output_mv, output_shape);
       }
     } else {
       // See the !has_out branch for an explanation
@@ -2167,11 +2173,14 @@ static Tensor _matmul_impl(
     }
 
     if (!has_out) {
-      if (vector_rhs) {
-        return at::_unsafe_view(tensor1_expanded.bmm(tensor2_expanded).squeeze(-1), output_shape);
-      } else {
-        return at::_unsafe_view(tensor1_expanded.bmm(tensor2_expanded), output_shape);
+      const auto result = tensor1_expanded.bmm(tensor2_expanded);
+      if (result.is_vulkan()) {
+        return result.reshape(output_shape);
       }
+      if (vector_rhs) {
+        return at::_unsafe_view(result.squeeze(-1), output_shape);
+      }
+      return at::_unsafe_view(result, output_shape);
     } else {
       at::native::resize_output(out, output_shape);
       auto reshaped_out = out.reshape({expand_batch_product, n, p});
