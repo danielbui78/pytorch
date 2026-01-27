@@ -89,9 +89,46 @@ Tensor zeros(
 }
 
 Tensor& fill_scalar(Tensor& self, const Scalar& value) {
-  auto cpu = at::empty_like(self, self.options().device(at::kCPU));
-  cpu.fill_(value);
-  self.copy_(cpu);
+  if (!self.is_vulkan()) {
+    return self.fill_(value);
+  }
+
+  if (!self.is_floating_point()) {
+    auto cpu = at::empty_like(self, self.options().device(at::kCPU));
+    cpu.fill_(value);
+    self.copy_(cpu);
+    return self;
+  }
+
+  vTensor& v_self = convert(self);
+  api::Context* const context = api::context();
+
+  const float fill_value = value.to<float>();
+  const struct Block final {
+    uvec3 extents;
+    int32_t fill0;
+    vec4 value;
+  } block{
+      v_self.extents(),
+      0,
+      {fill_value, fill_value, fill_value, fill_value},
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL(fill_scalar),
+      pipeline_barrier,
+      v_self.extents(),
+      adaptive_work_group_size(v_self.extents()),
+      VK_NULL_HANDLE,
+      v_self.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::READ | api::MemoryAccessType::WRITE),
+      params.buffer());
+
   return self;
 }
 
