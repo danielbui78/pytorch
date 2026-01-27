@@ -3,6 +3,11 @@
 #include <ATen/native/vulkan/ops/Common.h>
 #include <ATen/native/vulkan/ops/QuantizedFunctions.h>
 #include <ATen/native/vulkan/ops/Utils.h>
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#else
+#include <ATen/ops/eq.h>
+#endif
 #include <torch/library.h>
 
 namespace at {
@@ -596,6 +601,19 @@ static Tensor& floor_divide_tensor_(Tensor& self, const Tensor& other_arg) {
       VK_KERNEL(floor_divide_inplace));
 }
 
+static Tensor eq_scalar(const Tensor& self, const Scalar& other) {
+  const Tensor self_cpu = self.is_vulkan() ? self.cpu() : self;
+  Tensor out_cpu = at::eq(self_cpu, other);
+  return out_cpu.to(at::kVulkan);
+}
+
+static Tensor eq_tensor(const Tensor& self, const Tensor& other) {
+  const Tensor self_cpu = self.is_vulkan() ? self.cpu() : self;
+  const Tensor other_cpu = other.is_vulkan() ? other.cpu() : other;
+  Tensor out_cpu = at::eq(self_cpu, other_cpu);
+  return out_cpu.to(at::kVulkan);
+}
+
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(TORCH_SELECTIVE_NAME("aten::add.Scalar"), TORCH_FN(add_scalar));
   m.impl(TORCH_SELECTIVE_NAME("aten::add_.Scalar"), TORCH_FN(add_scalar_));
@@ -633,6 +651,8 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("aten::floor_divide_.Tensor"),
       TORCH_FN(floor_divide_tensor_));
+    m.impl(TORCH_SELECTIVE_NAME("aten::eq.Scalar"), TORCH_FN(eq_scalar));
+    m.impl(TORCH_SELECTIVE_NAME("aten::eq.Tensor"), TORCH_FN(eq_tensor));
 }
 
 } // namespace ops
