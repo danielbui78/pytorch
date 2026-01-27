@@ -152,6 +152,10 @@ class Adapter final {
     return physical_device_.timestamp_period;
   }
 
+  inline const VkPhysicalDeviceLimits& limits() const {
+    return physical_device_.properties.limits;
+  }
+
   // Queue Management
 
   Queue request_queue();
