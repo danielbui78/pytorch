@@ -1,11 +1,51 @@
 #include <ATen/native/vulkan/api/Tensor.h>
 #include <ATen/native/vulkan/api/Utils.h>
 
+#include <limits>
+
 namespace at {
 namespace native {
 namespace vulkan {
 
 namespace {
+
+bool fits_u32(const int64_t value) {
+  return value >= 0 &&
+      value <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+}
+
+bool can_pack_buffer_metadata(
+    const std::vector<int64_t>& sizes,
+    const std::vector<int64_t>& strides,
+    uint32_t* numel_out) {
+  for (const int64_t value : sizes) {
+    if (!fits_u32(value)) {
+      return false;
+    }
+  }
+
+  for (const int64_t value : strides) {
+    if (!fits_u32(value)) {
+      return false;
+    }
+  }
+
+  const uint64_t u32_max = std::numeric_limits<uint32_t>::max();
+  uint64_t acc = 1;
+  for (const int64_t value : sizes) {
+    if (value == 0) {
+      acc = 0;
+      break;
+    }
+    if (acc > u32_max / static_cast<uint64_t>(value)) {
+      return false;
+    }
+    acc *= static_cast<uint64_t>(value);
+  }
+
+  *numel_out = static_cast<uint32_t>(acc);
+  return true;
+}
 
 /*
  * Calculates the strides of a contiguous tensor. empty_tensor_restride from
@@ -200,11 +240,16 @@ api::UniformParamsBuffer make_metadata_uniform(
     return api::UniformParamsBuffer();
   }
 
+  uint32_t numel = 0;
+  VK_CHECK_COND(
+      can_pack_buffer_metadata(sizes, strides, &numel),
+      "Buffer metadata exceeds 32-bit limits; 64-bit metadata required.");
+
   vTensor::BufferMetadata metadata{
       api::utils::make_whcn_uvec4(sizes),
       api::utils::make_whcn_uvec4(strides),
       api::utils::safe_downcast<uint32_t>(sizes.size()),
-      api::utils::safe_downcast<uint32_t>(api::utils::multiply_integers(sizes)),
+      numel,
   };
 
   return api::UniformParamsBuffer(context, metadata);
