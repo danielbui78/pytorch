@@ -601,17 +601,120 @@ static Tensor& floor_divide_tensor_(Tensor& self, const Tensor& other_arg) {
       VK_KERNEL(floor_divide_inplace));
 }
 
-static Tensor eq_scalar(const Tensor& self, const Scalar& other) {
-  const Tensor self_cpu = self.is_vulkan() ? self.cpu() : self;
-  Tensor out_cpu = at::eq(self_cpu, other);
-  return out_cpu.to(at::kVulkan);
+static Tensor eq_scalar(const Tensor& self_arg, const Scalar& other) {
+  if (!self_arg.is_vulkan()) {
+    return at::eq(self_arg, other);
+  }
+
+  if (!self_arg.is_floating_point()) {
+    const Tensor self_cpu = self_arg.cpu();
+    Tensor out_cpu = at::eq(self_cpu, other);
+    return out_cpu.to(at::kVulkan);
+  }
+
+  api::Context* const context = api::context();
+  const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
+  const vTensor& v_self = convert(self);
+
+  vTensor v_output{
+      context,
+      v_self.sizes(),
+      api::kBool,
+  };
+
+  const float other_val = other.to<float>();
+  const struct Block final {
+    uvec3 extents;
+    int32_t fill0;
+    float other;
+  } block{
+      v_self.extents(),
+      0,
+      other_val,
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL(eq_scalar),
+      pipeline_barrier,
+      v_output.extents(),
+      adaptive_work_group_size(v_output.extents()),
+      VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_self.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
 }
 
-static Tensor eq_tensor(const Tensor& self, const Tensor& other) {
-  const Tensor self_cpu = self.is_vulkan() ? self.cpu() : self;
-  const Tensor other_cpu = other.is_vulkan() ? other.cpu() : other;
-  Tensor out_cpu = at::eq(self_cpu, other_cpu);
-  return out_cpu.to(at::kVulkan);
+static Tensor eq_tensor(const Tensor& self_arg, const Tensor& other_arg) {
+  if (!self_arg.is_vulkan() && !other_arg.is_vulkan()) {
+    return at::eq(self_arg, other_arg);
+  }
+
+  if (!self_arg.is_floating_point() || !other_arg.is_floating_point()) {
+    const Tensor self_cpu = self_arg.is_vulkan() ? self_arg.cpu() : self_arg;
+    const Tensor other_cpu = other_arg.is_vulkan() ? other_arg.cpu() : other_arg;
+    Tensor out_cpu = at::eq(self_cpu, other_cpu);
+    return out_cpu.to(at::kVulkan);
+  }
+
+  utils::is_broadcastable(self_arg, other_arg);
+  api::Context* const context = api::context();
+
+  const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
+  const vTensor& v_self = convert(self);
+  const Tensor other = other_arg.is_vulkan() ? other_arg : other_arg.vulkan();
+  const vTensor& v_other = convert(other);
+
+  vTensor v_output{
+      context,
+      utils::broadcast_size(self_arg, other_arg),
+      api::kBool,
+  };
+
+  const struct Block final {
+    uvec4 output_tensor_size;
+    uvec4 input_tensor_size;
+    uvec4 other_tensor_size;
+  } block{
+      {get_dim<Dim4D::Width>(v_output),
+       get_dim<Dim4D::Height>(v_output),
+       get_dim<Dim4D::Channel>(v_output),
+       get_dim<Dim4D::Batch>(v_output)},
+      {get_dim<Dim4D::Width>(v_self),
+       get_dim<Dim4D::Height>(v_self),
+       get_dim<Dim4D::Channel>(v_self),
+       get_dim<Dim4D::Batch>(v_self)},
+      {get_dim<Dim4D::Width>(v_other),
+       get_dim<Dim4D::Height>(v_other),
+       get_dim<Dim4D::Channel>(v_other),
+       get_dim<Dim4D::Batch>(v_other)},
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL(eq_tensor),
+      pipeline_barrier,
+      v_output.extents(),
+      adaptive_work_group_size(v_output.extents()),
+      VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_self.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_other.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  return convert(v_output);
 }
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
@@ -651,8 +754,8 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("aten::floor_divide_.Tensor"),
       TORCH_FN(floor_divide_tensor_));
-    m.impl(TORCH_SELECTIVE_NAME("aten::eq.Scalar"), TORCH_FN(eq_scalar));
-    m.impl(TORCH_SELECTIVE_NAME("aten::eq.Tensor"), TORCH_FN(eq_tensor));
+  m.impl(TORCH_SELECTIVE_NAME("aten::eq.Scalar"), TORCH_FN(eq_scalar));
+  m.impl(TORCH_SELECTIVE_NAME("aten::eq.Tensor"), TORCH_FN(eq_tensor));
 }
 
 } // namespace ops
