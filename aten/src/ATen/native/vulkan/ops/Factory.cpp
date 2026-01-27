@@ -40,18 +40,44 @@ Int64Extent3D estimate_texture_3d_extents(const std::vector<int64_t>& sizes) {
   return {width, height, depth};
 }
 
+bool exceeds_u32_numel(const IntArrayRef sizes) {
+  const uint64_t u32_max =
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+  uint64_t acc = 1;
+
+  for (const int64_t value : sizes) {
+    if (value < 0) {
+      return true;
+    }
+    if (value == 0) {
+      return false;
+    }
+    const uint64_t v = static_cast<uint64_t>(value);
+    if (v > u32_max || acc > u32_max / v) {
+      return true;
+    }
+    acc *= v;
+  }
+
+  return false;
+}
+
 bool needs_buffer_storage(const IntArrayRef sizes) {
   if (sizes.size() > 4) {
+    return true;
+  }
+
+  if (exceeds_u32_numel(sizes)) {
     return true;
   }
 
   const Int64Extent3D extents = estimate_texture_3d_extents(sizes.vec());
   const VkPhysicalDeviceLimits& limits =
       api::context()->adapter_ptr()->limits();
-    const int64_t u32_max = static_cast<int64_t>(
-      std::numeric_limits<uint32_t>::max());
+  const int64_t u32_max =
+      static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
 
-    return extents.width > static_cast<int64_t>(limits.maxImageDimension3D) ||
+  return extents.width > static_cast<int64_t>(limits.maxImageDimension3D) ||
       extents.height > static_cast<int64_t>(limits.maxImageDimension3D) ||
       extents.depth > static_cast<int64_t>(limits.maxImageDimension3D) ||
       extents.width > u32_max || extents.height > u32_max ||
