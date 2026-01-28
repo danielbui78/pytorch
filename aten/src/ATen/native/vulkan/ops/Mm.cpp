@@ -652,8 +652,8 @@ Tensor run_mm_buffer(const Tensor& mat1_arg, const Tensor& mat2_arg) {
 
   api::Context* const context = api::context();
 
-  const vTensor& v_input = convert(mat1);
-  const vTensor& v_weight = convert(mat2);
+  vTensor& v_input = convert(mat1);
+  vTensor& v_weight = convert(mat2);
 
   TORCH_CHECK(
       v_input.storage_type() == api::StorageType::BUFFER &&
