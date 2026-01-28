@@ -403,12 +403,16 @@ std::shared_ptr<api::UniformParamsBuffer> vTensor::extents_ubo() {
 }
 
 vTensor::BufferMetadata vTensor::get_cpu_buffer_metadata() const {
+  uint32_t numel = 0;
+  VK_CHECK_COND(
+      can_pack_buffer_metadata(sizes_, strides_, &numel),
+      "Buffer metadata exceeds 32-bit limits; 64-bit metadata required.");
+
   return {
       api::utils::make_whcn_uvec4(sizes_),
       api::utils::make_whcn_uvec4(strides_),
       api::utils::safe_downcast<uint32_t>(sizes_.size()),
-      api::utils::safe_downcast<uint32_t>(
-          api::utils::multiply_integers(sizes_)),
+      numel,
   };
 }
 
