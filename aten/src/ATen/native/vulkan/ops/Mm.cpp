@@ -17,6 +17,22 @@ namespace {
 using namespace api::utils;
 using namespace at::native::vulkan::ops;
 
+inline void check_storage_buffer_limit(
+    const vTensor& v_tensor,
+    const char* name) {
+  const VkDeviceSize limit =
+      api::context()->adapter_ptr()->limits().maxStorageBufferRange;
+  TORCH_CHECK(
+      v_tensor.gpu_nbytes() <= limit,
+      "Vulkan buffer ",
+      name,
+      " exceeds maxStorageBufferRange (",
+      v_tensor.gpu_nbytes(),
+      " > ",
+      limit,
+      ").");
+}
+
 vTensor pack_inputs_using_width_packing(const Tensor& input_arg) {
   TORCH_INTERNAL_ASSERT(
       !input_arg.is_quantized(),
@@ -672,6 +688,10 @@ Tensor run_mm_buffer(const Tensor& mat1_arg, const Tensor& mat2_arg) {
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
   };
 
+  check_storage_buffer_limit(v_input, "mm input");
+  check_storage_buffer_limit(v_weight, "mm weight");
+  check_storage_buffer_limit(v_output, "mm output");
+
   api::PipelineBarrier pipeline_barrier{};
 
   context->submit_compute_job(
@@ -758,6 +778,10 @@ Tensor run_addmm_buffer(
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
   };
 
+  check_storage_buffer_limit(v_input, "addmm input");
+  check_storage_buffer_limit(v_weight, "addmm weight");
+  check_storage_buffer_limit(v_output, "addmm output");
+
   const struct {
     vec4 alpha_beta;
   } block{
@@ -772,6 +796,8 @@ Tensor run_addmm_buffer(
       api::StorageType::BUFFER,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
   };
+
+  check_storage_buffer_limit(v_bias_buffer, "addmm bias");
 
   api::StorageBuffer bias_staging(
       context, api::kFloat, v_bias.gpu_numel(), true);
@@ -887,6 +913,10 @@ Tensor run_baddbmm_buffer(
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
   };
 
+  check_storage_buffer_limit(v_input, "baddbmm input");
+  check_storage_buffer_limit(v_weight, "baddbmm weight");
+  check_storage_buffer_limit(v_output, "baddbmm output");
+
   vTensor v_bias_buffer{
       context,
       bias.sizes().vec(),
@@ -894,6 +924,8 @@ Tensor run_baddbmm_buffer(
       api::StorageType::BUFFER,
       api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
   };
+
+  check_storage_buffer_limit(v_bias_buffer, "baddbmm bias");
 
   api::StorageBuffer bias_staging(
       context, api::kFloat, v_bias.gpu_numel(), true);
