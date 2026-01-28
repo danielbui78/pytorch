@@ -944,6 +944,27 @@ Tensor addmm(
     const Tensor& weight,
     const Scalar& beta,
     const Scalar& alpha) {
+  const Tensor input_vulkan = input.is_vulkan() ? input : input.vulkan();
+  const Tensor weight_vulkan = weight.is_vulkan() ? weight : weight.vulkan();
+
+  const vTensor& v_input = convert(input_vulkan);
+  const vTensor& v_weight = convert(weight_vulkan);
+
+  if (input_vulkan.dim() == 2 && weight_vulkan.dim() == 2 &&
+      v_input.storage_type() == api::StorageType::BUFFER &&
+      v_weight.storage_type() == api::StorageType::BUFFER) {
+    const float alpha_val = alpha.to<float>();
+    const float beta_val = beta.to<float>();
+    Tensor output = run_mm_buffer(input_vulkan, weight_vulkan);
+    if (alpha_val == 1.0f && beta_val == 0.0f) {
+      return output;
+    }
+    Tensor output_cpu = output.cpu();
+    Tensor bias_cpu = bias.cpu();
+    Tensor result_cpu = output_cpu.mul(alpha_val).add(bias_cpu.mul(beta_val));
+    return result_cpu.to(at::kVulkan);
+  }
+
   return run_addmm_context(
       input,
       alpha.to<float>(),
