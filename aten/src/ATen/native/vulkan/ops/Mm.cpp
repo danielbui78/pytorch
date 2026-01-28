@@ -634,6 +634,75 @@ Tensor run_quantized_addmm_context(
   }
 }
 
+Tensor run_mm_buffer(const Tensor& mat1_arg, const Tensor& mat2_arg) {
+  TORCH_CHECK(
+      mat1_arg.dim() == 2 && mat2_arg.dim() == 2,
+      "Vulkan buffer mm supports 2D tensors only.");
+
+  const Tensor mat1 = mat1_arg.is_vulkan() ? mat1_arg : mat1_arg.vulkan();
+  const Tensor mat2 = mat2_arg.is_vulkan() ? mat2_arg : mat2_arg.vulkan();
+
+  TORCH_CHECK(
+      mat1.is_contiguous() && mat2.is_contiguous(),
+      "Vulkan buffer mm requires contiguous inputs.");
+
+  TORCH_CHECK(
+      mat1.size(1) == mat2.size(0),
+      "Vulkan buffer mm: mat1.size(1) must equal mat2.size(0).");
+
+  api::Context* const context = api::context();
+
+  const vTensor& v_input = convert(mat1);
+  const vTensor& v_weight = convert(mat2);
+
+  TORCH_CHECK(
+      v_input.storage_type() == api::StorageType::BUFFER &&
+          v_weight.storage_type() == api::StorageType::BUFFER,
+      "Vulkan buffer mm requires buffer-backed tensors.");
+
+  TORCH_CHECK(
+      v_input.dtype() == v_weight.dtype(),
+      "Vulkan buffer mm requires matching dtypes.");
+
+  vTensor v_output{
+      context,
+      {mat1.size(0), mat2.size(1)},
+      v_input.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      // shader descriptor
+      VK_KERNEL(mm_buffer),
+      // pipeline barrier
+      pipeline_barrier,
+      // global work group size
+      {
+          safe_downcast<uint32_t>(mat2.size(1)),
+          safe_downcast<uint32_t>(mat1.size(0)),
+          1,
+      },
+      // local work group size
+      {8, 8, 1},
+      // fence handle
+      VK_NULL_HANDLE,
+      // shader arguments
+      v_output.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_output.buffer_metadata(),
+      v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_input.buffer_metadata(),
+      v_weight.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_weight.buffer_metadata());
+
+  return convert(v_output);
+}
+
 Tensor run_addmm_context(
     const Tensor& input_arg,
     const float alpha,
@@ -887,6 +956,16 @@ Tensor addmm(
 }
 
 Tensor mm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
+  const Tensor mat1 = mat1_arg.is_vulkan() ? mat1_arg : mat1_arg.vulkan();
+  const Tensor mat2 = mat2_arg.is_vulkan() ? mat2_arg : mat2_arg.vulkan();
+  const vTensor& v_mat1 = convert(mat1);
+  const vTensor& v_mat2 = convert(mat2);
+
+  if (v_mat1.storage_type() == api::StorageType::BUFFER &&
+      v_mat2.storage_type() == api::StorageType::BUFFER) {
+    return run_mm_buffer(mat1, mat2);
+  }
+
   return run_addmm_context(
       mat1_arg,
       1.0f,
