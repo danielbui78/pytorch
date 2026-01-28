@@ -703,6 +703,126 @@ Tensor run_mm_buffer(const Tensor& mat1_arg, const Tensor& mat2_arg) {
   return convert(v_output);
 }
 
+Tensor run_addmm_buffer(
+    const Tensor& input_arg,
+    const Tensor& weight_arg,
+    const Tensor& bias_arg,
+    const float alpha,
+    const float beta) {
+  TORCH_CHECK(
+      input_arg.dim() == 2 && weight_arg.dim() == 2,
+      "Vulkan buffer addmm supports 2D tensors only.");
+  TORCH_CHECK(
+      bias_arg.dim() == 1,
+      "Vulkan buffer addmm supports 1D bias only.");
+
+  const Tensor input = input_arg.is_vulkan() ? input_arg : input_arg.vulkan();
+  const Tensor weight = weight_arg.is_vulkan() ? weight_arg : weight_arg.vulkan();
+  const Tensor bias = bias_arg.is_vulkan() ? bias_arg : bias_arg.vulkan();
+
+  TORCH_CHECK(
+      input.is_contiguous() && weight.is_contiguous() && bias.is_contiguous(),
+      "Vulkan buffer addmm requires contiguous inputs.");
+
+  TORCH_CHECK(
+      input.size(1) == weight.size(0),
+      "Vulkan buffer addmm: input.size(1) must equal weight.size(0).");
+
+  TORCH_CHECK(
+      bias.numel() == 1 || bias.numel() == weight.size(1),
+      "Vulkan buffer addmm: bias must be size 1 or match weight.size(1).");
+
+  api::Context* const context = api::context();
+
+  vTensor& v_input = convert(input);
+  vTensor& v_weight = convert(weight);
+  vTensor& v_bias = convert(bias);
+
+  TORCH_CHECK(
+      v_input.storage_type() == api::StorageType::BUFFER &&
+          v_weight.storage_type() == api::StorageType::BUFFER,
+      "Vulkan buffer addmm requires buffer-backed input/weight.");
+
+  TORCH_CHECK(
+      v_input.dtype() == v_weight.dtype() && v_input.dtype() == v_bias.dtype(),
+      "Vulkan buffer addmm requires matching dtypes.");
+  TORCH_CHECK(
+      v_input.dtype() == api::kFloat,
+      "Vulkan buffer addmm currently supports float32 only.");
+
+  vTensor v_output{
+      context,
+      {input.size(0), weight.size(1)},
+      v_input.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  const struct {
+    vec4 alpha_beta;
+  } block{
+      {alpha, beta, 0.0f, 0.0f},
+  };
+  api::UniformParamsBuffer params(context, block);
+
+  vTensor v_bias_buffer{
+      context,
+      bias.sizes().vec(),
+      v_bias.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  api::StorageBuffer bias_staging(
+      context, api::kFloat, v_bias.gpu_numel(), true);
+  utils::pack_vtensor_to_staging(v_bias, bias_staging.buffer());
+
+  api::PipelineBarrier pipeline_barrier{};
+  add_buffer_barrier(
+      pipeline_barrier,
+      bias_staging.buffer(),
+      // Previous access
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::WRITE,
+      // Next access
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::READ);
+
+  utils::pack_buffer_to_vtensor(
+      bias_staging.buffer(), v_bias_buffer, pipeline_barrier);
+
+  context->submit_compute_job(
+      // shader descriptor
+      VK_KERNEL(addmm_buffer),
+      // pipeline barrier
+      pipeline_barrier,
+      // global work group size
+      {
+          safe_downcast<uint32_t>(weight.size(1)),
+          safe_downcast<uint32_t>(input.size(0)),
+          1,
+      },
+      // local work group size
+      {8, 8, 1},
+      // fence handle
+      VK_NULL_HANDLE,
+      // shader arguments
+      v_output.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_output.buffer_metadata(),
+      v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_input.buffer_metadata(),
+      v_weight.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_weight.buffer_metadata(),
+      v_bias_buffer.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_bias_buffer.buffer_metadata(),
+      params.buffer());
+
+  return convert(v_output);
+}
+
 Tensor run_addmm_context(
     const Tensor& input_arg,
     const float alpha,
@@ -953,16 +1073,12 @@ Tensor addmm(
   if (input_vulkan.dim() == 2 && weight_vulkan.dim() == 2 &&
       v_input.storage_type() == api::StorageType::BUFFER &&
       v_weight.storage_type() == api::StorageType::BUFFER) {
-    const float alpha_val = alpha.to<float>();
-    const float beta_val = beta.to<float>();
-    Tensor output = run_mm_buffer(input_vulkan, weight_vulkan);
-    if (alpha_val == 1.0f && beta_val == 0.0f) {
-      return output;
-    }
-    Tensor output_cpu = output.cpu();
-    Tensor bias_cpu = bias.cpu();
-    Tensor result_cpu = output_cpu.mul(alpha_val).add(bias_cpu.mul(beta_val));
-    return result_cpu.to(at::kVulkan);
+    return run_addmm_buffer(
+        input_vulkan,
+        weight_vulkan,
+        bias,
+        alpha.to<float>(),
+        beta.to<float>());
   }
 
   return run_addmm_context(
