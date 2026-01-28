@@ -823,6 +823,135 @@ Tensor run_addmm_buffer(
   return convert(v_output);
 }
 
+Tensor run_baddbmm_buffer(
+    const Tensor& input_arg,
+    const Tensor& weight_arg,
+    const std::optional<Tensor>& bias_arg,
+    const float alpha,
+    const float beta) {
+  TORCH_CHECK(
+      input_arg.dim() == 3 && weight_arg.dim() == 3,
+      "Vulkan buffer baddbmm supports 3D tensors only.");
+
+  const Tensor input = input_arg.is_vulkan() ? input_arg : input_arg.vulkan();
+  const Tensor weight =
+      weight_arg.is_vulkan() ? weight_arg : weight_arg.vulkan();
+
+  TORCH_CHECK(
+      input.is_contiguous() && weight.is_contiguous(),
+      "Vulkan buffer baddbmm requires contiguous inputs.");
+
+  TORCH_CHECK(
+      input.size(0) == weight.size(0) && input.size(2) == weight.size(1),
+      "Vulkan buffer baddbmm: input.size(0) must equal weight.size(0) and "
+      "input.size(2) must equal weight.size(1).");
+
+  Tensor bias = bias_arg.has_value()
+      ? (bias_arg->is_vulkan() ? *bias_arg : bias_arg->vulkan())
+      : at::zeros({1}, input.options().device(at::kVulkan));
+
+  TORCH_CHECK(
+      bias.is_contiguous(),
+      "Vulkan buffer baddbmm requires contiguous bias.");
+
+  TORCH_CHECK(
+      bias.numel() == 1 ||
+          (bias.dim() == 1 && bias.size(0) == weight.size(2)) ||
+          (bias.dim() == 3 && bias.size(0) == input.size(0) &&
+           bias.size(1) == input.size(1) && bias.size(2) == weight.size(2)),
+      "Vulkan buffer baddbmm: bias must be size 1, size N, or shape [B, M, N].");
+
+  api::Context* const context = api::context();
+
+  vTensor& v_input = convert(input);
+  vTensor& v_weight = convert(weight);
+  vTensor& v_bias = convert(bias);
+
+  TORCH_CHECK(
+      v_input.storage_type() == api::StorageType::BUFFER &&
+          v_weight.storage_type() == api::StorageType::BUFFER,
+      "Vulkan buffer baddbmm requires buffer-backed input/weight.");
+
+  TORCH_CHECK(
+      v_input.dtype() == v_weight.dtype() && v_input.dtype() == v_bias.dtype(),
+      "Vulkan buffer baddbmm requires matching dtypes.");
+  TORCH_CHECK(
+      v_input.dtype() == api::kFloat,
+      "Vulkan buffer baddbmm currently supports float32 only.");
+
+  vTensor v_output{
+      context,
+      {input.size(0), input.size(1), weight.size(2)},
+      v_input.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  vTensor v_bias_buffer{
+      context,
+      bias.sizes().vec(),
+      v_bias.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  api::StorageBuffer bias_staging(
+      context, api::kFloat, v_bias.gpu_numel(), true);
+  utils::pack_vtensor_to_staging(v_bias, bias_staging.buffer());
+
+  api::PipelineBarrier pipeline_barrier{};
+  add_buffer_barrier(
+      pipeline_barrier,
+      bias_staging.buffer(),
+      // Previous access
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::WRITE,
+      // Next access
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::READ);
+
+  utils::pack_buffer_to_vtensor(
+      bias_staging.buffer(), v_bias_buffer, pipeline_barrier);
+
+  const struct {
+    vec4 alpha_beta;
+  } block{
+      {alpha, beta, 0.0f, 0.0f},
+  };
+  api::UniformParamsBuffer params(context, block);
+
+  context->submit_compute_job(
+      // shader descriptor
+      VK_KERNEL(baddbmm_buffer),
+      // pipeline barrier
+      pipeline_barrier,
+      // global work group size
+      {
+          safe_downcast<uint32_t>(weight.size(2)),
+          safe_downcast<uint32_t>(input.size(1)),
+          safe_downcast<uint32_t>(input.size(0)),
+      },
+      // local work group size
+      {8, 8, 1},
+      // fence handle
+      VK_NULL_HANDLE,
+      // shader arguments
+      v_output.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_output.buffer_metadata(),
+      v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_input.buffer_metadata(),
+      v_weight.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_weight.buffer_metadata(),
+      v_bias_buffer.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_bias_buffer.buffer_metadata(),
+      params.buffer());
+
+  return convert(v_output);
+}
+
 Tensor run_addmm_context(
     const Tensor& input_arg,
     const float alpha,
@@ -1115,6 +1244,15 @@ Tensor mm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
 }
 
 Tensor bmm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
+  const Tensor mat1 = mat1_arg.is_vulkan() ? mat1_arg : mat1_arg.vulkan();
+  const Tensor mat2 = mat2_arg.is_vulkan() ? mat2_arg : mat2_arg.vulkan();
+  const vTensor& v_mat1 = convert(mat1);
+  const vTensor& v_mat2 = convert(mat2);
+
+  if (v_mat1.storage_type() == api::StorageType::BUFFER &&
+      v_mat2.storage_type() == api::StorageType::BUFFER) {
+    return run_baddbmm_buffer(mat1, mat2, std::nullopt, 1.0f, 0.0f);
+  }
   return run_baddbmm_context(
       mat1_arg,
       1.0f,
@@ -1142,6 +1280,20 @@ Tensor baddbmm(
     const Tensor& weight,
     const Scalar& beta,
     const Scalar& alpha) {
+  const Tensor input_vulkan = input.is_vulkan() ? input : input.vulkan();
+  const Tensor weight_vulkan = weight.is_vulkan() ? weight : weight.vulkan();
+  const vTensor& v_input = convert(input_vulkan);
+  const vTensor& v_weight = convert(weight_vulkan);
+
+  if (v_input.storage_type() == api::StorageType::BUFFER &&
+      v_weight.storage_type() == api::StorageType::BUFFER) {
+    return run_baddbmm_buffer(
+        input_vulkan,
+        weight_vulkan,
+        bias,
+        alpha.to<float>(),
+        beta.to<float>());
+  }
   return run_baddbmm_context(
       input,
       alpha.to<float>(),
