@@ -3,6 +3,7 @@
 #include <bitset>
 #include <cstring>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <utility>
 
@@ -346,7 +347,12 @@ Adapter::Adapter(
       pipeline_layout_cache_(device_.handle_),
       compute_pipeline_cache_(device_.handle_),
       sampler_cache_(device_.handle_),
-      vma_(instance_, physical_device_.handle, device_.handle_) {}
+      vma_(instance_, physical_device_.handle, device_.handle_) {
+  const char* log_adapter = std::getenv("TORCH_VULKAN_LOG_ADAPTER");
+  if (log_adapter && std::strcmp(log_adapter, "0") != 0) {
+    std::cout << *this;
+  }
+}
 
 Adapter::Queue Adapter::request_queue() {
   // Lock the mutex as multiple threads can request a queue at the same time

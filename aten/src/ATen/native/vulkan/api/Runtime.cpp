@@ -69,26 +69,34 @@ VkInstance create_instance(const RuntimeConfiguration& config) {
   std::vector<const char*> enabled_layers;
   std::vector<const char*> enabled_extensions;
 
+  std::vector<const char*> requested_layers;
+  std::vector<const char*> requested_extensions;
+
   if (config.enableValidationMessages) {
-    std::vector<const char*> requested_layers{
+    requested_layers = {
         // "VK_LAYER_LUNARG_api_dump",
         "VK_LAYER_KHRONOS_validation",
     };
-    std::vector<const char*> requested_extensions{
 #ifdef VK_EXT_debug_report
-        VK_EXT_DEBUG_REPORT_EXTENSION_NAME,
+    requested_extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
 #endif /* VK_EXT_debug_report */
-#ifdef __APPLE__
-        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
-#endif // __APPLE__
-    };
-
-    find_requested_layers_and_extensions(
-        enabled_layers,
-        enabled_extensions,
-        requested_layers,
-        requested_extensions);
   }
+
+#ifdef VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME
+  requested_extensions.push_back(
+      VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+#endif /* VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME */
+
+#ifdef __APPLE__
+  requested_extensions.push_back(
+      VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif // __APPLE__
+
+  find_requested_layers_and_extensions(
+      enabled_layers,
+      enabled_extensions,
+      requested_layers,
+      requested_extensions);
 
   const VkInstanceCreateInfo instance_create_info{
       VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, // sType
