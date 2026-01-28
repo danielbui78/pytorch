@@ -1,6 +1,26 @@
 #include <ATen/native/vulkan/api/Adapter.h>
 #include <ATen/native/vulkan/api/Resource.h>
 
+#include <cstdlib>
+#include <cstdio>
+
+namespace {
+
+bool has_device_local_host_visible(VmaAllocator allocator) {
+  const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
+  vmaGetMemoryProperties(allocator, &mem_props);
+  for (uint32_t i = 0; i < mem_props->memoryTypeCount; ++i) {
+    const VkMemoryPropertyFlags flags = mem_props->memoryTypes[i].propertyFlags;
+    if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+        (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
 namespace at {
 namespace native {
 namespace vulkan {
@@ -116,13 +136,50 @@ VulkanBuffer::VulkanBuffer(
   memory_.create_info = allocation_create_info;
 
   if (allocate_memory) {
-    VK_CHECK(vmaCreateBuffer(
+    const bool allow_host_retry =
+        (buffer_properties_.buffer_usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) &&
+        size >= (1024ull * 1024ull * 1024ull) &&
+        has_device_local_host_visible(allocator_) &&
+        allocation_create_info.usage == VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VkResult alloc_result = vmaCreateBuffer(
         allocator_,
         &buffer_create_info,
         &allocation_create_info,
         &handle_,
         &(memory_.allocation),
-        nullptr));
+        nullptr);
+    if (alloc_result == VK_ERROR_OUT_OF_DEVICE_MEMORY && allow_host_retry) {
+      VmaAllocationCreateInfo host_alloc_info = allocation_create_info;
+      host_alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+      host_alloc_info.requiredFlags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+      host_alloc_info.preferredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      alloc_result = vmaCreateBuffer(
+          allocator_,
+          &buffer_create_info,
+          &host_alloc_info,
+          &handle_,
+          &(memory_.allocation),
+          nullptr);
+    }
+    VK_CHECK(alloc_result);
+
+    const char* diag = std::getenv("TORCH_VULKAN_ALLOC_DIAGNOSTICS");
+    if (diag && diag[0] != '\0' && diag[0] != '0') {
+      VmaAllocationInfo alloc_info{};
+      vmaGetAllocationInfo(allocator_, memory_.allocation, &alloc_info);
+      const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
+      vmaGetMemoryProperties(allocator_, &mem_props);
+      const VkMemoryPropertyFlags flags =
+          mem_props->memoryTypes[alloc_info.memoryType].propertyFlags;
+      std::fprintf(
+          stdout,
+          "[vulkan_alloc] buffer size=%llu alloc_size=%llu type=%u flags=0x%x usage=0x%x\n",
+          static_cast<unsigned long long>(buffer_properties_.size),
+          static_cast<unsigned long long>(alloc_info.size),
+          alloc_info.memoryType,
+          static_cast<unsigned int>(flags),
+          static_cast<unsigned int>(buffer_properties_.buffer_usage));
+    }
   } else {
     VmaAllocatorInfo allocator_info{};
     vmaGetAllocatorInfo(allocator_, &allocator_info);
@@ -704,6 +761,7 @@ VulkanBuffer MemoryAllocator::create_storage_buffer(
   VmaAllocationCreateInfo alloc_create_info = {};
   alloc_create_info.flags = DEFAULT_ALLOCATION_STRATEGY;
   alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
 
   // The create storage buffer will be accessed by both the CPU and GPU, so set
   // the appropriate flags to indicate that the host device will be accessing
