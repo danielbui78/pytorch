@@ -57,6 +57,7 @@ class vTensorStorage final {
   // Resource sizings
   api::utils::uvec3 extents_{};
   int64_t buffer_length_{};
+  size_t buffer_element_size_{};
 
   // Image Texture
   mutable api::VulkanImage image_;
@@ -351,7 +352,11 @@ class vTensor final {
   }
 
   inline size_t nbytes() const {
-    return api::element_size(dtype()) * numel();
+    const size_t element_bytes =
+        (storage_type() == api::StorageType::BUFFER)
+        ? view_->buffer_element_size_
+        : api::element_size(dtype());
+    return element_bytes * numel();
   }
 
   /*
@@ -365,7 +370,11 @@ class vTensor final {
    * Return nbytes but bnased on gpu_sizes_ instead of sizes_
    */
   inline VkDeviceSize gpu_nbytes() const {
-    return api::element_size(dtype()) * gpu_numel();
+    const size_t element_bytes =
+        (storage_type() == api::StorageType::BUFFER)
+        ? view_->buffer_element_size_
+        : api::element_size(dtype());
+    return element_bytes * gpu_numel();
   }
 
   /*

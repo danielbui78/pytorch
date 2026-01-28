@@ -155,6 +155,18 @@ class Adapter final {
     return physical_device_.timestamp_period;
   }
 
+  inline bool supports_storage_buffer_16bit() const {
+    return physical_device_.supports_storage_buffer_16bit;
+  }
+
+  inline bool supports_uniform_and_storage_buffer_16bit() const {
+    return physical_device_.supports_uniform_and_storage_buffer_16bit;
+  }
+
+  inline bool supports_shader_float16() const {
+    return physical_device_.supports_shader_float16;
+  }
+
   inline const VkPhysicalDeviceLimits& limits() const {
     return physical_device_.properties.limits;
   }

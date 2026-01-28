@@ -8,6 +8,16 @@ namespace native {
 namespace vulkan {
 namespace packing {
 
+api::ShaderInfo buffer_to_buffer_shader(
+    api::Context* const context,
+    const vTensor& v_tensor) {
+  if (v_tensor.dtype() == api::kHalf &&
+      context->fp16_buffer_storage_enabled()) {
+    return VK_KERNEL(buffer_to_buffer_f16);
+  }
+  return VK_KERNEL(buffer_to_buffer);
+}
+
 api::ShaderInfo get_nchw_to_image_shader(const vTensor& v_dst) {
   if (v_dst.is_quantized()) {
     switch (v_dst.storage_type()) {
@@ -242,7 +252,7 @@ void record_nchw_to_buffer_op(
 
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL(buffer_to_buffer),
+      buffer_to_buffer_shader(context, v_dst),
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -277,7 +287,7 @@ bool record_buffer_to_nchw_op(
 
   return context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL(buffer_to_buffer),
+      buffer_to_buffer_shader(context, v_src),
       // pipeline barrier
       pipeline_barrier,
       // global work group size

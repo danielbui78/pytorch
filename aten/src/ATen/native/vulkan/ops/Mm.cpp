@@ -43,6 +43,15 @@ inline bool buffer_shaders_enabled() {
   return enabled;
 }
 
+inline bool fp16_buffer_storage_enabled() {
+  return api::context()->fp16_buffer_storage_enabled();
+}
+
+inline bool buffer_dtype_supported(const vTensor& v_tensor) {
+  return v_tensor.dtype() == api::kFloat ||
+      (v_tensor.dtype() == api::kHalf && fp16_buffer_storage_enabled());
+}
+
 vTensor pack_inputs_using_width_packing(const Tensor& input_arg) {
   TORCH_INTERNAL_ASSERT(
       !input_arg.is_quantized(),
@@ -689,6 +698,10 @@ Tensor run_mm_buffer(const Tensor& mat1_arg, const Tensor& mat2_arg) {
   TORCH_CHECK(
       v_input.dtype() == v_weight.dtype(),
       "Vulkan buffer mm requires matching dtypes.");
+  TORCH_CHECK(
+      v_input.dtype() == api::kFloat ||
+          (v_input.dtype() == api::kHalf && fp16_buffer_storage_enabled()),
+      "Vulkan buffer mm requires float32, or fp16 buffer storage to be enabled.");
 
   vTensor v_output{
       context,
@@ -704,9 +717,13 @@ Tensor run_mm_buffer(const Tensor& mat1_arg, const Tensor& mat2_arg) {
 
   api::PipelineBarrier pipeline_barrier{};
 
+  const api::ShaderInfo shader =
+      (v_input.dtype() == api::kHalf) ? VK_KERNEL(mm_buffer_f16)
+                                      : VK_KERNEL(mm_buffer);
+
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL(mm_buffer),
+      shader,
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -777,8 +794,9 @@ Tensor run_addmm_buffer(
       v_input.dtype() == v_weight.dtype() && v_input.dtype() == v_bias.dtype(),
       "Vulkan buffer addmm requires matching dtypes.");
   TORCH_CHECK(
-      v_input.dtype() == api::kFloat,
-      "Vulkan buffer addmm currently supports float32 only.");
+      v_input.dtype() == api::kFloat ||
+          (v_input.dtype() == api::kHalf && fp16_buffer_storage_enabled()),
+      "Vulkan buffer addmm requires float32, or fp16 buffer storage to be enabled.");
 
   vTensor v_output{
       context,
@@ -810,7 +828,7 @@ Tensor run_addmm_buffer(
   check_storage_buffer_limit(v_bias_buffer, "addmm bias");
 
   api::StorageBuffer bias_staging(
-      context, api::kFloat, v_bias.gpu_numel(), true);
+      context, v_bias.dtype(), v_bias.gpu_numel(), true);
   utils::pack_vtensor_to_staging(v_bias, bias_staging.buffer());
 
   api::PipelineBarrier pipeline_barrier{};
@@ -827,9 +845,13 @@ Tensor run_addmm_buffer(
   utils::pack_buffer_to_vtensor(
       bias_staging.buffer(), v_bias_buffer, pipeline_barrier);
 
+  const api::ShaderInfo shader =
+      (v_input.dtype() == api::kHalf) ? VK_KERNEL(addmm_buffer_f16)
+                                      : VK_KERNEL(addmm_buffer);
+
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL(addmm_buffer),
+      shader,
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -912,8 +934,9 @@ Tensor run_baddbmm_buffer(
       v_input.dtype() == v_weight.dtype() && v_input.dtype() == v_bias.dtype(),
       "Vulkan buffer baddbmm requires matching dtypes.");
   TORCH_CHECK(
-      v_input.dtype() == api::kFloat,
-      "Vulkan buffer baddbmm currently supports float32 only.");
+      v_input.dtype() == api::kFloat ||
+          (v_input.dtype() == api::kHalf && fp16_buffer_storage_enabled()),
+      "Vulkan buffer baddbmm requires float32, or fp16 buffer storage to be enabled.");
 
   vTensor v_output{
       context,
@@ -938,7 +961,7 @@ Tensor run_baddbmm_buffer(
   check_storage_buffer_limit(v_bias_buffer, "baddbmm bias");
 
   api::StorageBuffer bias_staging(
-      context, api::kFloat, v_bias.gpu_numel(), true);
+      context, v_bias.dtype(), v_bias.gpu_numel(), true);
   utils::pack_vtensor_to_staging(v_bias, bias_staging.buffer());
 
   api::PipelineBarrier pipeline_barrier{};
@@ -962,9 +985,13 @@ Tensor run_baddbmm_buffer(
   };
   api::UniformParamsBuffer params(context, block);
 
+  const api::ShaderInfo shader =
+      (v_input.dtype() == api::kHalf) ? VK_KERNEL(baddbmm_buffer_f16)
+                                      : VK_KERNEL(baddbmm_buffer);
+
   context->submit_compute_job(
       // shader descriptor
-      VK_KERNEL(baddbmm_buffer),
+      shader,
       // pipeline barrier
       pipeline_barrier,
       // global work group size
@@ -1244,7 +1271,9 @@ Tensor addmm(
   if (buffer_shaders_enabled() && input_vulkan.dim() == 2 &&
       weight_vulkan.dim() == 2 &&
       v_input.storage_type() == api::StorageType::BUFFER &&
-      v_weight.storage_type() == api::StorageType::BUFFER) {
+      v_weight.storage_type() == api::StorageType::BUFFER &&
+      buffer_dtype_supported(v_input) &&
+      buffer_dtype_supported(v_weight)) {
     return run_addmm_buffer(
         input_vulkan,
         weight_vulkan,
@@ -1272,7 +1301,9 @@ Tensor mm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
 
   if (buffer_shaders_enabled() &&
       v_mat1.storage_type() == api::StorageType::BUFFER &&
-      v_mat2.storage_type() == api::StorageType::BUFFER) {
+      v_mat2.storage_type() == api::StorageType::BUFFER &&
+      buffer_dtype_supported(v_mat1) &&
+      buffer_dtype_supported(v_mat2)) {
     return run_mm_buffer(mat1, mat2);
   }
 
@@ -1295,7 +1326,9 @@ Tensor bmm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
 
   if (buffer_shaders_enabled() &&
       v_mat1.storage_type() == api::StorageType::BUFFER &&
-      v_mat2.storage_type() == api::StorageType::BUFFER) {
+      v_mat2.storage_type() == api::StorageType::BUFFER &&
+      buffer_dtype_supported(v_mat1) &&
+      buffer_dtype_supported(v_mat2)) {
     return run_baddbmm_buffer(mat1, mat2, std::nullopt, 1.0f, 0.0f);
   }
   return run_baddbmm_context(
@@ -1332,7 +1365,9 @@ Tensor baddbmm(
 
   if (buffer_shaders_enabled() &&
       v_input.storage_type() == api::StorageType::BUFFER &&
-      v_weight.storage_type() == api::StorageType::BUFFER) {
+      v_weight.storage_type() == api::StorageType::BUFFER &&
+      buffer_dtype_supported(v_input) &&
+      buffer_dtype_supported(v_weight)) {
     return run_baddbmm_buffer(
         input_vulkan,
         weight_vulkan,

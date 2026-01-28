@@ -2,14 +2,15 @@
  * Computes a 4D tensor coordinate from a linearized index
  */
 uvec4 idx_to_coord(const uint idx, const uvec4 strides, const uvec4 sizes) {
-  return ivec4(mod(idx / strides, sizes));
+  return (uvec4(idx) / strides) % sizes;
 }
 
 /*
  * Computes a linearized index from a 4D tensor coordinate
  */
 uint coord_to_idx(const uvec4 coord, const uvec4 strides) {
-  return int(dot(coord * strides, ivec4(1)));
+  return coord.x * strides.x + coord.y * strides.y +
+      coord.z * strides.z + coord.w * strides.w;
 }
 
 int align_up_4(int v) {

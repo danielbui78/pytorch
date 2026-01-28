@@ -1,6 +1,7 @@
 #include <ATen/native/vulkan/api/Tensor.h>
 #include <ATen/native/vulkan/api/Utils.h>
 
+#include <cstdint>
 #include <limits>
 
 namespace at {
@@ -416,6 +417,16 @@ vTensor::BufferMetadata vTensor::get_cpu_buffer_metadata() const {
   };
 }
 
+size_t buffer_element_size(
+    api::Context* const context,
+    const api::ScalarType dtype) {
+  size_t element_bytes = api::element_size(dtype);
+  if (dtype == api::kHalf && context->fp16_buffer_storage_enabled()) {
+    element_bytes = sizeof(uint16_t);
+  }
+  return element_bytes;
+}
+
 VmaAllocationCreateInfo vTensor::get_allocation_create_info() const {
   switch (storage_type()) {
     case api::StorageType::BUFFER:
@@ -581,7 +592,9 @@ static api::VulkanBuffer allocate_buffer(
   }
 
   return adapter_ptr->vma().create_storage_buffer(
-      api::element_size(dtype) * numel, /*gpu_only = */ true, allocate_memory);
+      buffer_element_size(context_ptr, dtype) * numel,
+      /*gpu_only = */ true,
+      allocate_memory);
 }
 
 vTensorStorage::vTensorStorage(
@@ -596,6 +609,7 @@ vTensorStorage::vTensorStorage(
       extents_(
           create_image_extents(gpu_sizes, storage_type, gpu_memory_layout)),
       buffer_length_{api::utils::multiply_integers(gpu_sizes)},
+      buffer_element_size_(buffer_element_size(context, dtype)),
       image_(allocate_image(
           context_,
           extents_,
@@ -720,6 +734,7 @@ void vTensorStorage::discard_and_reallocate(
   flush();
 
   extents_ = create_image_extents(gpu_sizes, storage_type_, gpu_memory_layout);
+  buffer_element_size_ = buffer_element_size(context_, dtype);
   image_ = allocate_image(
       context_,
       extents_,

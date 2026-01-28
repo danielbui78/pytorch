@@ -12,6 +12,13 @@ namespace ops {
 // Utility functions for memcpy
 //
 
+static bool use_fp16_buffer_staging(
+    api::Context* const context,
+    const vTensor& v_tensor) {
+  return v_tensor.storage_type() == api::StorageType::BUFFER &&
+      v_tensor.dtype() == api::kHalf && context->fp16_buffer_storage_enabled();
+}
+
 void memcpy_to_mapping(const Tensor& src, api::MemoryMap& dst_mapping) {
   if (src.dtype() == at::kFloat) {
     memcpy_to_mapping_impl<float>(src, dst_mapping);
@@ -155,24 +162,33 @@ void pack_cpu_to_vulkan(const Tensor& src, vTensor& dst) {
   // Ensure that src is contiguous in its memory format
   Tensor src_contig = src.contiguous(src.suggest_memory_format());
 
+  const bool fp16_buffer_staging = use_fp16_buffer_staging(context, dst);
+  const api::ScalarType staging_dtype =
+      fp16_buffer_staging ? api::kHalf : api::kFloat;
+
   // Note that the float data type has been enforced for the storage buffer
-  // below. The reason for this is that the nchw_to_image and image_to_nchw
-  // shaders which perform the transfer to/from an image texture expect a buffer
-  // of floats as input. GLSL/Vulkan does not natively support 16 bit arithmetic
-  // types, so for now storage buffers created for compute shaders must define
-  // floats as their base data type.
-  api::StorageBuffer staging(context, api::kFloat, dst.gpu_numel());
+  // below when targeting textures. The nchw_to_image and image_to_nchw shaders
+  // expect a buffer of floats as input. For fp16 buffer storage, use half.
+  api::StorageBuffer staging(context, staging_dtype, dst.gpu_numel());
   {
     api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::WRITE);
 
-    // If the dtype() of src is at::kHalf, then first convert it to 32 bit
-    // float. This is required since the nchw_to_image shader uses a float
-    // buffer as input (note that at::kFloat is used to create the StorageBuffer
-    // above).
-    if (src.dtype() == at::kHalf) {
-      memcpy_to_mapping(src_contig.to(at::kFloat), mapping);
+    if (fp16_buffer_staging) {
+      if (src.dtype() == at::kHalf) {
+        memcpy_to_mapping(src_contig, mapping);
+      } else {
+        memcpy_to_mapping(src_contig.to(at::kHalf), mapping);
+      }
     } else {
-      memcpy_to_mapping(src_contig, mapping);
+      // If the dtype() of src is at::kHalf, then first convert it to 32 bit
+      // float. This is required since the nchw_to_image shader uses a float
+      // buffer as input (note that at::kFloat is used to create the
+      // StorageBuffer above).
+      if (src.dtype() == at::kHalf) {
+        memcpy_to_mapping(src_contig.to(at::kFloat), mapping);
+      } else {
+        memcpy_to_mapping(src_contig, mapping);
+      }
     }
   }
   utils::pack_staging_to_vtensor(staging.buffer(), dst);
@@ -184,9 +200,13 @@ void pack_vulkan_to_cpu(vTensor& src, Tensor& dst) {
       "Copy of vulkan quantized tensors to cpu is currently disabled!");
   api::Context* const context = api::context();
 
+  const bool fp16_buffer_staging = use_fp16_buffer_staging(context, src);
+  const api::ScalarType staging_dtype =
+      fp16_buffer_staging ? api::kHalf : api::kFloat;
+
   // Refer to the comment in pack_cpu_to_vulkan for why at::kFloat is specified
-  // for the storage buffer below.
-  api::StorageBuffer staging(context, api::kFloat, src.gpu_numel());
+  // for the storage buffer below when targeting textures.
+  api::StorageBuffer staging(context, staging_dtype, src.gpu_numel());
 
   api::VulkanFence fence = context->fences().get_fence();
 
@@ -215,14 +235,24 @@ void pack_vulkan_to_cpu(vTensor& src, Tensor& dst) {
     api::MemoryMap mapping(staging.buffer(), api::MemoryAccessType::READ);
     mapping.invalidate();
 
-    // If the dtype() of dst is at::kHalf, then copy the data into a float
-    // version of it first, similar to pack_cpu_to_vulkan().
-    if (dst.dtype() == at::kHalf) {
-      Tensor dst_float = dst.to(at::kFloat);
-      memcpy_from_mapping(mapping, dst_float);
-      dst = dst_float.to(at::kHalf);
+    if (fp16_buffer_staging) {
+      if (dst.dtype() == at::kHalf) {
+        memcpy_from_mapping(mapping, dst);
+      } else {
+        Tensor dst_half = dst.to(at::kHalf);
+        memcpy_from_mapping(mapping, dst_half);
+        dst = dst_half.to(dst.dtype());
+      }
     } else {
-      memcpy_from_mapping(mapping, dst);
+      // If the dtype() of dst is at::kHalf, then copy the data into a float
+      // version of it first, similar to pack_cpu_to_vulkan().
+      if (dst.dtype() == at::kHalf) {
+        Tensor dst_float = dst.to(at::kFloat);
+        memcpy_from_mapping(mapping, dst_float);
+        dst = dst_float.to(at::kHalf);
+      } else {
+        memcpy_from_mapping(mapping, dst);
+      }
     }
   }
 

@@ -6,6 +6,9 @@
 
 #include <ATen/native/vulkan/api/vk_api.h>
 
+#include <cstdlib>
+#include <cstdint>
+
 #include <ATen/native/vulkan/api/Adapter.h>
 #include <ATen/native/vulkan/api/Command.h>
 #include <ATen/native/vulkan/api/Descriptor.h>
@@ -101,6 +104,19 @@ class Context final {
 
   inline VkQueue queue() {
     return queue_.handle;
+  }
+
+  inline bool fp16_buffer_storage_enabled() const {
+    static const bool env_enabled = []() {
+      const char* env = std::getenv("TORCH_VULKAN_ENABLE_FP16_BUFFER_STORAGE");
+      return env && env[0] != '\0' && env[0] != '0';
+    }();
+    if (!env_enabled) {
+      return false;
+    }
+    return (adapter_p_->supports_storage_buffer_16bit() ||
+            adapter_p_->supports_uniform_and_storage_buffer_16bit()) &&
+        adapter_p_->supports_shader_float16();
   }
 
   // Device Caches
@@ -267,7 +283,13 @@ class StorageBuffer final {
       : context_p_(context_p),
         dtype_(dtype),
         numel_(numel),
-        nbytes_(element_size(dtype_) * numel_),
+        nbytes_([&]() {
+          size_t element_bytes = element_size(dtype_);
+          if (dtype_ == kHalf && context_p_->fp16_buffer_storage_enabled()) {
+            element_bytes = sizeof(uint16_t);
+          }
+          return element_bytes * numel_;
+        }()),
         vulkan_buffer_(context_p_->adapter_ptr()->vma().create_storage_buffer(
             nbytes_,
             gpuonly)) {}
