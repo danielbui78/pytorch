@@ -8,6 +8,8 @@
 #include <ATen/native/vulkan/impl/Packing.h>
 #include <c10/util/irange.h>
 
+#include <cstdlib>
+
 namespace at {
 namespace native {
 namespace vulkan {
@@ -31,6 +33,14 @@ inline void check_storage_buffer_limit(
       " > ",
       limit,
       ").");
+}
+
+inline bool buffer_shaders_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("TORCH_VULKAN_DISABLE_BUFFER_SHADERS");
+    return !(env && env[0] != '\0' && env[0] != '0');
+  }();
+  return enabled;
 }
 
 vTensor pack_inputs_using_width_packing(const Tensor& input_arg) {
@@ -1231,7 +1241,8 @@ Tensor addmm(
   const vTensor& v_input = convert(input_vulkan);
   const vTensor& v_weight = convert(weight_vulkan);
 
-  if (input_vulkan.dim() == 2 && weight_vulkan.dim() == 2 &&
+  if (buffer_shaders_enabled() && input_vulkan.dim() == 2 &&
+      weight_vulkan.dim() == 2 &&
       v_input.storage_type() == api::StorageType::BUFFER &&
       v_weight.storage_type() == api::StorageType::BUFFER) {
     return run_addmm_buffer(
@@ -1259,7 +1270,8 @@ Tensor mm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
   const vTensor& v_mat1 = convert(mat1);
   const vTensor& v_mat2 = convert(mat2);
 
-  if (v_mat1.storage_type() == api::StorageType::BUFFER &&
+  if (buffer_shaders_enabled() &&
+      v_mat1.storage_type() == api::StorageType::BUFFER &&
       v_mat2.storage_type() == api::StorageType::BUFFER) {
     return run_mm_buffer(mat1, mat2);
   }
@@ -1281,7 +1293,8 @@ Tensor bmm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
   const vTensor& v_mat1 = convert(mat1);
   const vTensor& v_mat2 = convert(mat2);
 
-  if (v_mat1.storage_type() == api::StorageType::BUFFER &&
+  if (buffer_shaders_enabled() &&
+      v_mat1.storage_type() == api::StorageType::BUFFER &&
       v_mat2.storage_type() == api::StorageType::BUFFER) {
     return run_baddbmm_buffer(mat1, mat2, std::nullopt, 1.0f, 0.0f);
   }
@@ -1317,7 +1330,8 @@ Tensor baddbmm(
   const vTensor& v_input = convert(input_vulkan);
   const vTensor& v_weight = convert(weight_vulkan);
 
-  if (v_input.storage_type() == api::StorageType::BUFFER &&
+  if (buffer_shaders_enabled() &&
+      v_input.storage_type() == api::StorageType::BUFFER &&
       v_weight.storage_type() == api::StorageType::BUFFER) {
     return run_baddbmm_buffer(
         input_vulkan,
