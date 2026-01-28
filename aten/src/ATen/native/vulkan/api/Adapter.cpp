@@ -1,6 +1,7 @@
 #include <ATen/native/vulkan/api/Adapter.h>
 
 #include <bitset>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -475,24 +476,28 @@ std::string Adapter::stringize() const {
   ss << "  }" << std::endl;
   ;
 
-  const VkPhysicalDeviceMemoryProperties& mem_props =
-      physical_device_.memory_properties;
+  const char* log_memory =
+      std::getenv("TORCH_VULKAN_LOG_ADAPTER_MEMORY");
+  if (log_memory && std::strcmp(log_memory, "0") != 0) {
+    const VkPhysicalDeviceMemoryProperties& mem_props =
+        physical_device_.memory_properties;
 
-  ss << "  Memory Info {" << std::endl;
-  ss << "    Memory Types [" << std::endl;
-  for (size_t i = 0; i < mem_props.memoryTypeCount; ++i) {
-    ss << "      "
-       << " [Heap " << mem_props.memoryTypes[i].heapIndex << "] "
-       << get_memory_properties_str(mem_props.memoryTypes[i].propertyFlags)
-       << std::endl;
+    ss << "  Memory Info {" << std::endl;
+    ss << "    Memory Types [" << std::endl;
+    for (size_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+      ss << "      "
+         << " [Heap " << mem_props.memoryTypes[i].heapIndex << "] "
+         << get_memory_properties_str(mem_props.memoryTypes[i].propertyFlags)
+         << std::endl;
+    }
+    ss << "    ]" << std::endl;
+    ss << "    Memory Heaps [" << std::endl;
+    for (size_t i = 0; i < mem_props.memoryHeapCount; ++i) {
+      ss << "      " << mem_props.memoryHeaps[i].size << std::endl;
+    }
+    ss << "    ]" << std::endl;
+    ss << "  }" << std::endl;
   }
-  ss << "    ]" << std::endl;
-  ss << "    Memory Heaps [" << std::endl;
-  for (size_t i = 0; i < mem_props.memoryHeapCount; ++i) {
-    ss << "      " << mem_props.memoryHeaps[i].size << std::endl;
-  }
-  ss << "    ]" << std::endl;
-  ss << "  }" << std::endl;
 
   ss << "  Queue Families {" << std::endl;
   for (const VkQueueFamilyProperties& queue_family_props :

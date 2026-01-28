@@ -107,11 +107,18 @@ class Context final {
   }
 
   inline bool fp16_buffer_storage_enabled() const {
-    static const bool env_enabled = []() {
+    static const int env_enabled = []() {
       const char* env = std::getenv("TORCH_VULKAN_ENABLE_FP16_BUFFER_STORAGE");
-      return env && env[0] != '\0' && env[0] != '0';
+      if (!env || env[0] == '\0') {
+        return -1;
+      }
+      if (env[0] == '0' || env[0] == 'f' || env[0] == 'F' || env[0] == 'n' ||
+          env[0] == 'N') {
+        return 0;
+      }
+      return 1;
     }();
-    if (!env_enabled) {
+    if (env_enabled == 0) {
       return false;
     }
     return (adapter_p_->supports_storage_buffer_16bit() ||

@@ -6,6 +6,18 @@
 
 namespace {
 
+bool alloc_diagnostics_enabled() {
+  const char* env = std::getenv("TORCH_VULKAN_ALLOC_DIAGNOSTICS");
+  if (!env || env[0] == '\0') {
+    return false;
+  }
+  if (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' ||
+      env[0] == 'Y') {
+    return true;
+  }
+  return false;
+}
+
 bool has_device_local_host_visible(VmaAllocator allocator) {
   const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
   vmaGetMemoryProperties(allocator, &mem_props);
@@ -163,8 +175,7 @@ VulkanBuffer::VulkanBuffer(
     }
     VK_CHECK(alloc_result);
 
-    const char* diag = std::getenv("TORCH_VULKAN_ALLOC_DIAGNOSTICS");
-    if (diag && diag[0] != '\0' && diag[0] != '0') {
+    if (alloc_diagnostics_enabled()) {
       VmaAllocationInfo alloc_info{};
       vmaGetAllocationInfo(allocator_, memory_.allocation, &alloc_info);
       const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
