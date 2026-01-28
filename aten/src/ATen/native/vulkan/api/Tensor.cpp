@@ -205,10 +205,20 @@ api::utils::uvec3 create_image_extents(
         "Texture storage only valid for 1 <= ndim <= 4!");
 
     using namespace api::utils;
-    uint32_t width = safe_downcast<uint32_t>(val_at(-1, gpu_sizes));
-    uint32_t height = safe_downcast<uint32_t>(val_at(-2, gpu_sizes));
-    uint32_t channels = safe_downcast<uint32_t>(val_at(-3, gpu_sizes));
-    uint32_t batch = safe_downcast<uint32_t>(val_at(-4, gpu_sizes));
+    const int64_t width_i = val_at(-1, gpu_sizes);
+    const int64_t height_i = val_at(-2, gpu_sizes);
+    const int64_t channels_i = val_at(-3, gpu_sizes);
+    const int64_t batch_i = val_at(-4, gpu_sizes);
+
+    VK_CHECK_COND(
+        fits_u32(width_i) && fits_u32(height_i) && fits_u32(channels_i) &&
+            fits_u32(batch_i),
+        "Texture extents exceed 32-bit limits; buffer storage required.");
+
+    uint32_t width = safe_downcast<uint32_t>(width_i);
+    uint32_t height = safe_downcast<uint32_t>(height_i);
+    uint32_t channels = safe_downcast<uint32_t>(channels_i);
+    uint32_t batch = safe_downcast<uint32_t>(batch_i);
 
     switch (memory_layout) {
       case api::GPUMemoryLayout::TENSOR_WIDTH_PACKED:
