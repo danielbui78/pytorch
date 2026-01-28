@@ -19,10 +19,37 @@ PhysicalDevice::PhysicalDevice(VkPhysicalDevice physical_device_handle)
       num_compute_queues(0),
       has_unified_memory(false),
       has_timestamps(properties.limits.timestampComputeAndGraphics),
-      timestamp_period(properties.limits.timestampPeriod) {
+      timestamp_period(properties.limits.timestampPeriod),
+      supports_storage_buffer_16bit(false),
+      supports_uniform_and_storage_buffer_16bit(false),
+      supports_shader_float16(false) {
   // Extract physical device properties
   vkGetPhysicalDeviceProperties(handle, &properties);
   vkGetPhysicalDeviceMemoryProperties(handle, &memory_properties);
+
+  // Query optional 16-bit storage support
+  VkPhysicalDeviceFeatures2 features2{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, // sType
+      nullptr, // pNext
+      VkPhysicalDeviceFeatures{}, // features
+  };
+  VkPhysicalDevice16BitStorageFeatures storage16{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, // sType
+      nullptr, // pNext
+  };
+  VkPhysicalDeviceShaderFloat16Int8Features float16_int8{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, // sType
+      nullptr, // pNext
+  };
+  features2.pNext = &storage16;
+  storage16.pNext = &float16_int8;
+  vkGetPhysicalDeviceFeatures2(handle, &features2);
+
+  supports_storage_buffer_16bit =
+      storage16.storageBuffer16BitAccess == VK_TRUE;
+  supports_uniform_and_storage_buffer_16bit =
+      storage16.uniformAndStorageBuffer16BitAccess == VK_TRUE;
+  supports_shader_float16 = float16_int8.shaderFloat16 == VK_TRUE;
 
   // Check if there are any memory types have both the HOST_VISIBLE and the
   // DEVICE_LOCAL property flags
@@ -134,6 +161,15 @@ VkDevice create_logical_device(
 #ifdef VK_KHR_portability_subset
       VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
 #endif /* VK_KHR_portability_subset */
+#ifdef VK_KHR_16BIT_STORAGE_EXTENSION_NAME
+      VK_KHR_16BIT_STORAGE_EXTENSION_NAME,
+#endif /* VK_KHR_16BIT_STORAGE_EXTENSION_NAME */
+#ifdef VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME
+      VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME,
+#endif /* VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME */
+#ifdef VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME
+      VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
+#endif /* VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME */
   };
 
   std::vector<const char*> enabled_device_extensions;
@@ -142,9 +178,41 @@ VkDevice create_logical_device(
       enabled_device_extensions,
       requested_device_extensions);
 
+  VkPhysicalDeviceFeatures2 enabled_features{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, // sType
+      nullptr, // pNext
+      VkPhysicalDeviceFeatures{}, // features
+  };
+  VkPhysicalDevice16BitStorageFeatures enabled_storage16{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, // sType
+      nullptr, // pNext
+  };
+  VkPhysicalDeviceShaderFloat16Int8Features enabled_float16_int8{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, // sType
+      nullptr, // pNext
+  };
+  enabled_storage16.storageBuffer16BitAccess =
+      physical_device.supports_storage_buffer_16bit ? VK_TRUE : VK_FALSE;
+  enabled_storage16.uniformAndStorageBuffer16BitAccess =
+      physical_device.supports_uniform_and_storage_buffer_16bit ? VK_TRUE
+                                                                : VK_FALSE;
+  enabled_storage16.storagePushConstant16 = VK_FALSE;
+  enabled_storage16.storageInputOutput16 = VK_FALSE;
+  enabled_float16_int8.shaderFloat16 =
+      physical_device.supports_shader_float16 ? VK_TRUE : VK_FALSE;
+  enabled_float16_int8.shaderInt8 = VK_FALSE;
+  enabled_features.pNext = &enabled_storage16;
+  enabled_storage16.pNext = &enabled_float16_int8;
+
+  const bool enable_16bit_chain =
+      (enabled_storage16.storageBuffer16BitAccess == VK_TRUE) ||
+      (enabled_storage16.uniformAndStorageBuffer16BitAccess == VK_TRUE) ||
+      (enabled_float16_int8.shaderFloat16 == VK_TRUE);
+  const void* device_pnext = enable_16bit_chain ? &enabled_features : nullptr;
+
   const VkDeviceCreateInfo device_create_info{
       VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, // sType
-      nullptr, // pNext
+      device_pnext, // pNext
       0u, // flags
       static_cast<uint32_t>(queue_create_infos.size()), // queueCreateInfoCount
       queue_create_infos.data(), // pQueueCreateInfos
@@ -385,6 +453,18 @@ std::string Adapter::stringize() const {
   PRINT_LIMIT_PROP_VEC3(maxComputeWorkGroupCount);
   PRINT_LIMIT_PROP(maxComputeWorkGroupInvocations);
   PRINT_LIMIT_PROP_VEC3(maxComputeWorkGroupSize);
+  ss << "    }" << std::endl;
+  ss << "    Feature Support {" << std::endl;
+  ss << "      storageBuffer16BitAccess: "
+     << (physical_device_.supports_storage_buffer_16bit ? "true" : "false")
+     << std::endl;
+  ss << "      uniformAndStorageBuffer16BitAccess: "
+     << (physical_device_.supports_uniform_and_storage_buffer_16bit ? "true"
+                                                                    : "false")
+     << std::endl;
+  ss << "      shaderFloat16: "
+     << (physical_device_.supports_shader_float16 ? "true" : "false")
+     << std::endl;
   ss << "    }" << std::endl;
   ss << "  }" << std::endl;
   ;

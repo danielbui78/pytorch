@@ -33,6 +33,9 @@ struct PhysicalDevice final {
   bool has_unified_memory;
   bool has_timestamps;
   float timestamp_period;
+  bool supports_storage_buffer_16bit;
+  bool supports_uniform_and_storage_buffer_16bit;
+  bool supports_shader_float16;
 
   explicit PhysicalDevice(VkPhysicalDevice);
 };
