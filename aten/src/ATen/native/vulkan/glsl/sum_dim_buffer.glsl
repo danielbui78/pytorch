@@ -1,38 +1,39 @@
 #version 450 core
 
-#define PRECISION ${PRECISION}
+#define FP_PRECISION ${PRECISION}   // mediump/highp for floats if desired
+#define INT_PRECISION highp         // always high precision for indices/metadata
 #define FORMAT ${FORMAT}
 
 layout(std430) buffer;
 
-layout(set = 0, binding = 0) buffer PRECISION restrict writeonly OutBuffer {
+layout(set = 0, binding = 0) buffer FP_PRECISION restrict writeonly OutBuffer {
   float data[];
 }
 uOutput;
 
-layout(set = 0, binding = 1) uniform PRECISION restrict OutMeta {
-  uvec4 sizes;
-  uvec4 strides;
-  uint ndim;
-  uint buf_length;
+layout(set = 0, binding = 1) uniform INT_PRECISION restrict OutMeta {
+  highp uvec4 sizes;
+  highp uvec4 strides;
+  highp uint ndim;
+  highp uint buf_length;
 }
 uOutMeta;
 
-layout(set = 0, binding = 2) buffer PRECISION restrict readonly InBuffer {
+layout(set = 0, binding = 2) buffer FP_PRECISION restrict readonly InBuffer {
   float data[];
 }
 uInput;
 
-layout(set = 0, binding = 3) uniform PRECISION restrict InMeta {
-  uvec4 sizes;
-  uvec4 strides;
-  uint ndim;
-  uint buf_length;
+layout(set = 0, binding = 3) uniform INT_PRECISION restrict InMeta {
+  highp uvec4 sizes;
+  highp uvec4 strides;
+  highp uint ndim;
+  highp uint buf_length;
 }
 uInMeta;
 
-layout(set = 0, binding = 4) uniform PRECISION restrict Block {
-  uvec2 dim_info;
+layout(set = 0, binding = 4) uniform INT_PRECISION restrict Block {
+  highp uvec2 dim_info;
 }
 uBlock;
 
@@ -48,12 +49,15 @@ void main() {
 
   const uvec4 write_coord =
       idx_to_coord(write_idx, uOutMeta.strides, uOutMeta.sizes);
-  uvec4 in_coord = write_coord;
+  highp uvec4 in_coord = write_coord;
 
-  float accumulator = 0.0;
-  for (uint i = 0u; i < uBlock.dim_info.y; ++i) {
+  highp float accumulator = 0.0;
+  for (highp uint i = 0u; i < uBlock.dim_info.y; ++i) {
     in_coord[uBlock.dim_info.x] = i;
-    const uint in_idx = coord_to_idx(in_coord, uInMeta.strides);
+    const highp uint in_idx = coord_to_idx(in_coord, uInMeta.strides);
+    if (in_idx >= uInMeta.buf_length) {
+      continue;
+    }
     accumulator += uInput.data[in_idx];
   }
 
