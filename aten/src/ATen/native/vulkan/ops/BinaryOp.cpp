@@ -1,12 +1,14 @@
 #ifdef USE_VULKAN_API
 #include <ATen/ArrayRef.h>
 #include <ATen/native/vulkan/ops/Common.h>
+#include <ATen/native/vulkan/ops/Copy.h>
 #include <ATen/native/vulkan/ops/QuantizedFunctions.h>
 #include <ATen/native/vulkan/ops/Utils.h>
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #else
 #include <ATen/ops/eq.h>
+#include <ATen/ops/floor_divide.h>
 #endif
 #include <torch/library.h>
 
@@ -16,6 +18,64 @@ namespace vulkan {
 namespace ops {
 
 using namespace api::utils;
+
+namespace {
+
+inline bool fp16_buffer_storage_enabled() {
+  return api::context()->fp16_buffer_storage_enabled();
+}
+
+inline bool buffer_dtype_supported(const vTensor& v_tensor) {
+  return v_tensor.dtype() == api::kFloat ||
+      (v_tensor.dtype() == api::kHalf && fp16_buffer_storage_enabled());
+}
+
+inline void check_storage_buffer_limit(
+    const vTensor& v_tensor,
+    const char* name) {
+  const VkDeviceSize limit =
+      api::context()->adapter_ptr()->limits().maxStorageBufferRange;
+  TORCH_CHECK(
+      v_tensor.gpu_nbytes() <= limit,
+      "Vulkan buffer ",
+      name,
+      " exceeds maxStorageBufferRange (",
+      v_tensor.gpu_nbytes(),
+      " > ",
+      limit,
+      ").");
+}
+
+inline api::GPUMemoryLayout buffer_output_layout(
+    const vTensor& v_self,
+    const vTensor& v_other) {
+  return (v_self.gpu_memory_layout() == v_other.gpu_memory_layout())
+      ? v_self.gpu_memory_layout()
+      : api::GPUMemoryLayout::TENSOR_WIDTH_PACKED;
+}
+
+inline const api::ShaderInfo& select_buffer_shader(
+    const vTensor& v_tensor,
+    const api::ShaderInfo& shader_float,
+    const api::ShaderInfo& shader_f16) {
+  return (v_tensor.dtype() == api::kHalf) ? shader_f16 : shader_float;
+}
+
+static Tensor to_buffer_tensor(const Tensor& src_arg) {
+  Tensor src_cpu = src_arg.is_vulkan() ? src_arg.cpu() : src_arg;
+  Tensor src_contig = src_cpu.contiguous(src_cpu.suggest_memory_format());
+  vTensor v_buffer = ops::to_vulkan(src_contig, api::StorageType::BUFFER);
+  return convert(v_buffer);
+}
+
+static Tensor to_texture_tensor(const Tensor& src_arg) {
+  Tensor src_cpu = src_arg.is_vulkan() ? src_arg.cpu() : src_arg;
+  Tensor src_contig = src_cpu.contiguous(src_cpu.suggest_memory_format());
+  vTensor v_texture = ops::to_vulkan(src_contig, api::StorageType::TEXTURE_3D);
+  return convert(v_texture);
+}
+
+} // namespace
 
 static Tensor binary_op_scalar(
     const Tensor& self_arg,
@@ -158,16 +218,94 @@ static Tensor binary_op_tensor(
     const Tensor& self_arg,
     const Tensor& other_arg,
     const std::optional<Scalar>& alpha_arg,
-    const api::ShaderInfo& shader_descriptor) {
+    const api::ShaderInfo& shader_descriptor,
+    const api::ShaderInfo& buffer_shader_descriptor,
+    const api::ShaderInfo& buffer_shader_descriptor_f16) {
   utils::is_broadcastable(self_arg, other_arg);
   api::Context* const context = api::context();
 
-  const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
-  const vTensor& v_self = convert(self);
-
+  Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
   Tensor other = binary_op_preprocess_other_arg(other_arg);
 
-  const vTensor& v_other = convert(other);
+  vTensor& v_self_raw = convert(self);
+  vTensor& v_other_raw = convert(other);
+  const bool any_buffer = v_self_raw.storage_type() == api::StorageType::BUFFER ||
+      v_other_raw.storage_type() == api::StorageType::BUFFER;
+
+  if (any_buffer) {
+    if (v_self_raw.storage_type() != api::StorageType::BUFFER) {
+      self = to_buffer_tensor(self);
+    }
+    if (v_other_raw.storage_type() != api::StorageType::BUFFER) {
+      other = to_buffer_tensor(other);
+    }
+    vTensor& v_self = convert(self);
+    vTensor& v_other = convert(other);
+
+    TORCH_CHECK(
+        v_self.storage_type() == api::StorageType::BUFFER &&
+            v_other.storage_type() == api::StorageType::BUFFER,
+        "Vulkan buffer binary op requires buffer-backed tensors.");
+    TORCH_CHECK(
+        v_self.dtype() == v_other.dtype(),
+        "Vulkan buffer binary op requires matching dtypes.");
+    TORCH_CHECK(
+        buffer_dtype_supported(v_self),
+        "Vulkan buffer binary op requires float32, or fp16 buffer storage to be enabled.");
+
+    vTensor v_output{
+        context,
+        utils::broadcast_size(self_arg, other_arg),
+        v_self.dtype(),
+        api::StorageType::BUFFER,
+        buffer_output_layout(v_self, v_other),
+    };
+
+    check_storage_buffer_limit(v_self, "binary op input");
+    check_storage_buffer_limit(v_other, "binary op other");
+    check_storage_buffer_limit(v_output, "binary op output");
+
+    const float alpha = alpha_arg ? alpha_arg->to<float>() : 1.0f;
+    const struct Block final {
+      vec4 alpha;
+    } block{
+        {alpha, 0.0f, 0.0f, 0.0f},
+    };
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+
+    const api::ShaderInfo& buffer_shader =
+        select_buffer_shader(v_self, buffer_shader_descriptor, buffer_shader_descriptor_f16);
+
+    context->submit_compute_job(
+        // shader descriptor
+        buffer_shader,
+        // pipeline barrier
+        pipeline_barrier,
+        // global work group size
+        {safe_downcast<uint32_t>(v_output.gpu_numel()), 1u, 1u},
+        // local work group size
+        {32u, 1u, 1u},
+        // fence handle
+        VK_NULL_HANDLE,
+        // shader arguments
+        v_output.buffer(
+            pipeline_barrier,
+            api::PipelineStage::COMPUTE,
+            api::MemoryAccessType::WRITE),
+        v_output.buffer_metadata(),
+        v_self.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_self.buffer_metadata(),
+        v_other.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_other.buffer_metadata(),
+        params.buffer());
+
+    return convert(v_output);
+  }
+
+  vTensor& v_self = v_self_raw;
+  vTensor& v_other = v_other_raw;
 
   vTensor v_output{
       context,
@@ -319,7 +457,9 @@ static Tensor& binary_op_tensor_(
     Tensor& self_arg,
     const Tensor& other_arg,
     const std::optional<Scalar>& alpha_arg,
-    const api::ShaderInfo& shader_descriptor) {
+    const api::ShaderInfo& shader_descriptor,
+    const api::ShaderInfo& buffer_shader_descriptor,
+    const api::ShaderInfo& buffer_shader_descriptor_f16) {
   TORCH_CHECK(
       get_dim<Dim4D::Batch>(self_arg) >= get_dim<Dim4D::Batch>(other_arg) &&
           get_dim<Dim4D::Channel>(self_arg) >=
@@ -341,8 +481,72 @@ static Tensor& binary_op_tensor_(
   vTensor& v_self = convert(self_arg);
 
   Tensor other = binary_op_preprocess_other_arg(other_arg);
+  vTensor& v_other_raw = convert(other);
 
-  const vTensor& v_other = convert(other);
+  if (v_self.storage_type() == api::StorageType::BUFFER) {
+    if (v_other_raw.storage_type() != api::StorageType::BUFFER) {
+      other = to_buffer_tensor(other);
+    }
+    vTensor& v_other = convert(other);
+
+    TORCH_CHECK(
+        v_other.storage_type() == api::StorageType::BUFFER,
+        "Vulkan buffer binary op requires buffer-backed other tensor.");
+    TORCH_CHECK(
+        v_self.dtype() == v_other.dtype(),
+        "Vulkan buffer binary op requires matching dtypes.");
+    TORCH_CHECK(
+        buffer_dtype_supported(v_self),
+        "Vulkan buffer binary op requires float32, or fp16 buffer storage to be enabled.");
+
+    check_storage_buffer_limit(v_self, "binary op self");
+    check_storage_buffer_limit(v_other, "binary op other");
+
+    const float alpha = alpha_arg ? alpha_arg->to<float>() : 1.0f;
+    const struct Block final {
+      vec4 alpha;
+    } block{
+        {alpha, 0.0f, 0.0f, 0.0f},
+    };
+
+    api::UniformParamsBuffer params(context, block);
+    api::PipelineBarrier pipeline_barrier{};
+
+    auto& self_buffer = v_self.buffer(
+        pipeline_barrier,
+        api::PipelineStage::COMPUTE,
+        api::MemoryAccessType::READ | api::MemoryAccessType::WRITE);
+
+    const api::ShaderInfo& buffer_shader =
+        select_buffer_shader(v_self, buffer_shader_descriptor, buffer_shader_descriptor_f16);
+
+    context->submit_compute_job(
+        // shader descriptor
+        buffer_shader,
+        // pipeline barrier
+        pipeline_barrier,
+        // global work group size
+        {safe_downcast<uint32_t>(v_self.gpu_numel()), 1u, 1u},
+        // local work group size
+        {32u, 1u, 1u},
+        // fence handle
+        VK_NULL_HANDLE,
+        // shader arguments
+        self_buffer,
+        v_self.buffer_metadata(),
+        self_buffer,
+        v_self.buffer_metadata(),
+        v_other.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+        v_other.buffer_metadata(),
+        params.buffer());
+
+    return self_arg;
+  }
+
+  if (v_other_raw.storage_type() == api::StorageType::BUFFER) {
+    other = to_texture_tensor(other);
+  }
+  vTensor& v_other = convert(other);
 
   const double alpha = alpha_arg ? alpha_arg->to<double>() : 1.0;
   const struct Block final {
@@ -446,7 +650,12 @@ static Tensor add_tensor(
     const Tensor& other_arg,
     const Scalar& alpha) {
   return binary_op_tensor(
-      self_arg, other_arg, std::optional<Scalar>(alpha), VK_KERNEL(add));
+      self_arg,
+      other_arg,
+      std::optional<Scalar>(alpha),
+      VK_KERNEL(add),
+      VK_KERNEL(add_buffer),
+      VK_KERNEL(add_buffer_f16));
 }
 
 static Tensor& add_tensor_(
@@ -454,7 +663,12 @@ static Tensor& add_tensor_(
     const Tensor& other_arg,
     const Scalar& alpha) {
   return binary_op_tensor_(
-      self, other_arg, std::optional<Scalar>(alpha), VK_KERNEL(add_inplace));
+      self,
+      other_arg,
+      std::optional<Scalar>(alpha),
+      VK_KERNEL(add_inplace),
+      VK_KERNEL(add_buffer),
+      VK_KERNEL(add_buffer_f16));
 }
 
 static Tensor sub_scalar(
@@ -484,7 +698,12 @@ static Tensor sub_tensor(
     const Tensor& other_arg,
     const Scalar& alpha) {
   return binary_op_tensor(
-      self_arg, other_arg, std::optional<Scalar>(alpha), VK_KERNEL(sub));
+      self_arg,
+      other_arg,
+      std::optional<Scalar>(alpha),
+      VK_KERNEL(sub),
+      VK_KERNEL(sub_buffer),
+      VK_KERNEL(sub_buffer_f16));
 }
 
 static Tensor& sub_tensor_(
@@ -492,7 +711,12 @@ static Tensor& sub_tensor_(
     const Tensor& other_arg,
     const Scalar& alpha) {
   return binary_op_tensor_(
-      self, other_arg, std::optional<Scalar>(alpha), VK_KERNEL(sub_inplace));
+      self,
+      other_arg,
+      std::optional<Scalar>(alpha),
+      VK_KERNEL(sub_inplace),
+      VK_KERNEL(sub_buffer),
+      VK_KERNEL(sub_buffer_f16));
 }
 
 static Tensor mul_scalar(const Tensor& self_arg, const Scalar& other) {
@@ -507,12 +731,22 @@ static Tensor& mul_scalar_(Tensor& self, const Scalar& other) {
 
 static Tensor mul_tensor(const Tensor& self_arg, const Tensor& other_arg) {
   return binary_op_tensor(
-      self_arg, other_arg, std::optional<Scalar>(), VK_KERNEL(mul));
+      self_arg,
+      other_arg,
+      std::optional<Scalar>(),
+      VK_KERNEL(mul),
+      VK_KERNEL(mul_buffer),
+      VK_KERNEL(mul_buffer_f16));
 }
 
 static Tensor& mul_tensor_(Tensor& self, const Tensor& other_arg) {
   return binary_op_tensor_(
-      self, other_arg, std::optional<Scalar>(), VK_KERNEL(mul_inplace));
+      self,
+      other_arg,
+      std::optional<Scalar>(),
+      VK_KERNEL(mul_inplace),
+      VK_KERNEL(mul_buffer),
+      VK_KERNEL(mul_buffer_f16));
 }
 
 static Tensor div_scalar(const Tensor& self_arg, const Scalar& other) {
@@ -533,21 +767,42 @@ static Tensor& div_scalar_(Tensor& self, const Scalar& other) {
 
 static Tensor div_tensor(const Tensor& self_arg, const Tensor& other_arg) {
   return binary_op_tensor(
-      self_arg, other_arg, std::optional<Scalar>(), VK_KERNEL(div));
+      self_arg,
+      other_arg,
+      std::optional<Scalar>(),
+      VK_KERNEL(div),
+      VK_KERNEL(div_buffer),
+      VK_KERNEL(div_buffer_f16));
 }
 
 static Tensor& div_tensor_(Tensor& self, const Tensor& other_arg) {
   return binary_op_tensor_(
-      self, other_arg, std::optional<Scalar>(), VK_KERNEL(div_inplace));
+      self,
+      other_arg,
+      std::optional<Scalar>(),
+      VK_KERNEL(div_inplace),
+      VK_KERNEL(div_buffer),
+      VK_KERNEL(div_buffer_f16));
 }
 
 static Tensor pow(const Tensor& self, const Tensor& other) {
-  return binary_op_tensor(self, other, std::optional<Scalar>(), VK_KERNEL(pow));
+  return binary_op_tensor(
+      self,
+      other,
+      std::optional<Scalar>(),
+      VK_KERNEL(pow),
+      VK_KERNEL(pow_buffer),
+      VK_KERNEL(pow_buffer_f16));
 }
 
 static Tensor& pow_(Tensor& self, const Tensor& other) {
   return binary_op_tensor_(
-      self, other, std::optional<Scalar>(), VK_KERNEL(pow_inplace));
+      self,
+      other,
+      std::optional<Scalar>(),
+      VK_KERNEL(pow_inplace),
+      VK_KERNEL(pow_buffer),
+      VK_KERNEL(pow_buffer_f16));
 }
 
 static Tensor pow_tensor_scalar(const Tensor& self, const Scalar& other) {
@@ -589,16 +844,55 @@ static Tensor& floor_divide_scalar_(Tensor& self, const Scalar& other) {
 }
 
 static Tensor floor_divide_tensor(const Tensor& self, const Tensor& other) {
+  if (self.is_vulkan() || other.is_vulkan()) {
+    const Tensor self_vk = self.is_vulkan() ? self : self.vulkan();
+    const Tensor other_vk = other.is_vulkan() ? other : other.vulkan();
+    vTensor& v_self = convert(self_vk);
+    vTensor& v_other = convert(other_vk);
+    const bool any_buffer =
+        v_self.storage_type() == api::StorageType::BUFFER ||
+        v_other.storage_type() == api::StorageType::BUFFER;
+    const bool any_half =
+        v_self.dtype() == api::kHalf || v_other.dtype() == api::kHalf;
+    if (any_buffer && any_half) {
+      Tensor self_cpu = self_vk.cpu().to(at::kFloat);
+      Tensor other_cpu = other_vk.cpu().to(at::kFloat);
+      Tensor out_cpu = at::floor_divide(self_cpu, other_cpu).to(at::kHalf);
+      return out_cpu.to(at::kVulkan);
+    }
+  }
   return binary_op_tensor(
-      self, other, std::optional<Scalar>(), VK_KERNEL(floor_divide));
+      self,
+      other,
+      std::optional<Scalar>(),
+      VK_KERNEL(floor_divide),
+      VK_KERNEL(floor_divide_buffer),
+      VK_KERNEL(floor_divide_buffer_f16));
 }
 
 static Tensor& floor_divide_tensor_(Tensor& self, const Tensor& other_arg) {
+  if (self.is_vulkan()) {
+    const Tensor other = other_arg.is_vulkan() ? other_arg : other_arg.vulkan();
+    vTensor& v_self = convert(self);
+    vTensor& v_other = convert(other);
+    const bool any_buffer =
+        v_self.storage_type() == api::StorageType::BUFFER ||
+        v_other.storage_type() == api::StorageType::BUFFER;
+    const bool any_half =
+        v_self.dtype() == api::kHalf || v_other.dtype() == api::kHalf;
+    if (any_buffer && any_half) {
+      Tensor out = floor_divide_tensor(self, other);
+      self.copy_(out);
+      return self;
+    }
+  }
   return binary_op_tensor_(
       self,
       other_arg,
       std::optional<Scalar>(),
-      VK_KERNEL(floor_divide_inplace));
+      VK_KERNEL(floor_divide_inplace),
+      VK_KERNEL(floor_divide_buffer),
+      VK_KERNEL(floor_divide_buffer_f16));
 }
 
 static Tensor eq_scalar(const Tensor& self_arg, const Scalar& other) {
