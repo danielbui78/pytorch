@@ -10,6 +10,108 @@ namespace {
 
 using namespace api::utils;
 
+inline bool buffer_reduction_dtype_supported(const api::ScalarType dtype) {
+  return dtype == api::kFloat ||
+      (dtype == api::kHalf && api::context()->fp16_buffer_storage_enabled());
+}
+
+inline void check_storage_buffer_limit(
+    const vTensor& v_tensor,
+    const char* name) {
+  const VkDeviceSize limit =
+      api::context()->adapter_ptr()->limits().maxStorageBufferRange;
+  TORCH_CHECK(
+      v_tensor.gpu_nbytes() <= limit,
+      "Vulkan buffer ",
+      name,
+      " exceeds maxStorageBufferRange (",
+      v_tensor.gpu_nbytes(),
+      " > ",
+      limit,
+      ").");
+}
+
+inline uint32_t reduction_dim_size(const vTensor& v_tensor, uint32_t dim) {
+  switch (dim) {
+    case 0u:
+      return get_dim<Dim4D::Batch>(v_tensor);
+    case 1u:
+      return get_dim<Dim4D::Channel>(v_tensor);
+    case 2u:
+      return get_dim<Dim4D::Height>(v_tensor);
+    case 3u:
+      return get_dim<Dim4D::Width>(v_tensor);
+    default:
+      return 1u;
+  }
+}
+
+inline const api::ShaderInfo& select_mean_buffer_shader(
+    const api::ScalarType dtype) {
+  return (dtype == api::kHalf) ? VK_KERNEL(mean_dim_buffer_f16)
+                               : VK_KERNEL(mean_dim_buffer);
+}
+
+Tensor run_mean_buffer_reduction(
+    api::Context* const context,
+    vTensor& v_input,
+    const std::vector<int64_t>& output_size,
+    const std::vector<int64_t>& full_output_size,
+    bool keepdim,
+    uint32_t axis,
+    uint32_t dim_size,
+    const api::ScalarType output_dtype) {
+  vTensor v_output_buffer{
+      context,
+      full_output_size,
+      output_dtype,
+      api::StorageType::BUFFER,
+      v_input.gpu_memory_layout(),
+  };
+
+  check_storage_buffer_limit(v_input, "mean input");
+  check_storage_buffer_limit(v_output_buffer, "mean output");
+
+  const struct Block final {
+    uvec2 dim_info;
+    float factor;
+  } block{
+      {axis, dim_size},
+      dim_size == 0u ? 0.0f : 1.0f / static_cast<float>(dim_size),
+  };
+
+  api::UniformParamsBuffer params(context, block);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      // shader descriptor
+      select_mean_buffer_shader(output_dtype),
+      // pipeline barrier
+      pipeline_barrier,
+      // global work group size
+      {safe_downcast<uint32_t>(v_output_buffer.gpu_numel()), 1u, 1u},
+      // local work group size
+      {32u, 1u, 1u},
+      // fence handle
+      VK_NULL_HANDLE,
+      // shader arguments
+      v_output_buffer.buffer(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      v_output_buffer.buffer_metadata(),
+      v_input.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
+      v_input.buffer_metadata(),
+      // params buffer
+      params.buffer());
+
+  Tensor result = convert(v_output_buffer);
+  if (!keepdim) {
+    result = result.reshape(output_size);
+  }
+  return result;
+}
+
 Tensor mean_dim(
     const at::Tensor& self,
     int64_t dim,
@@ -32,45 +134,70 @@ Tensor mean_dim(
 
   // Cast the input Tensor to a vTensor
   const Tensor input = self.is_vulkan() ? self : self.vulkan();
-  const vTensor& v_input = convert(input);
+  vTensor& v_input = convert(input);
 
   // Normalize dim into range [0, self.dim()]
   dim = utils::normalize(dim, self.dim());
 
   // Create the output texture
   std::vector<int64_t> output_size = v_input.sizes();
+  std::vector<int64_t> full_output_size = v_input.sizes();
   uint32_t dim_size = output_size[dim];
   if (keepdim) {
     output_size[dim] = 1;
   } else {
     output_size.erase(output_size.begin() + dim);
   }
+  full_output_size[dim] = 1;
 
   ScalarType type = self.scalar_type();
   if (dtype.has_value()) {
     type = dtype.value();
   }
 
-  vTensor v_output{
-      context,
-      output_size,
-      convert_dtype(type),
-  };
+  const api::ScalarType output_dtype = convert_dtype(type);
 
   // Required to determine how to insert memory barriers in the command buffer
   api::PipelineBarrier pipeline_barrier{};
+
+  const int64_t buffer_dim = dim;
 
   // Shift dim into 4d range
   if (self.dim() < 4) {
     dim += (4 - self.dim());
   }
 
+  const uint32_t normalized_dim = static_cast<uint32_t>(dim);
+  const bool use_buffer_path =
+      v_input.storage_type() == api::StorageType::BUFFER &&
+      buffer_reduction_dtype_supported(output_dtype);
+  if (use_buffer_path) {
+    const uint32_t axis =
+        safe_downcast<uint32_t>((self.dim() - 1) - buffer_dim);
+    const uint32_t reduction_size = dim_size;
+    return run_mean_buffer_reduction(
+        context,
+        v_input,
+        output_size,
+        full_output_size,
+        keepdim,
+        axis,
+        reduction_size,
+        output_dtype);
+  }
+
+  vTensor v_output{
+      context,
+      output_size,
+      output_dtype,
+  };
+
   // Create the params buffer
   const struct Block final {
     uvec2 dim_info;
     int32_t channel;
   } block{
-      {static_cast<uint32_t>(dim), dim_size},
+      {normalized_dim, dim_size},
       static_cast<int32_t>(get_dim<Dim4D::Channel>(v_input)),
   };
 

@@ -116,3 +116,23 @@ unary_op:
       OPERATOR: sqrt(X)
     - NAME: log
       OPERATOR: log(X)
+
+sum_dim_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: sum_dim_buffer
+
+sum_dim_buffer_f16:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: sum_dim_buffer_f16
+
+mean_dim_buffer:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: mean_dim_buffer
+
+mean_dim_buffer_f16:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: mean_dim_buffer_f16
