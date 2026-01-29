@@ -19,6 +19,51 @@ static bool use_fp16_buffer_staging(
       v_tensor.dtype() == api::kHalf && context->fp16_buffer_storage_enabled();
 }
 
+static api::ScalarType staging_dtype_for_copy(
+    api::Context* const context,
+    const vTensor& v_src,
+    const vTensor& v_dst) {
+  const bool buffer_only =
+      v_src.storage_type() == api::StorageType::BUFFER &&
+      v_dst.storage_type() == api::StorageType::BUFFER;
+
+  if (!buffer_only) {
+    return api::kFloat;
+  }
+
+  if (use_fp16_buffer_staging(context, v_src) &&
+      use_fp16_buffer_staging(context, v_dst)) {
+    return api::kHalf;
+  }
+
+  return api::kFloat;
+}
+
+static void transfer_vulkan_to_vulkan_staging(
+    vTensor& v_src,
+    vTensor& v_dst,
+    const api::ScalarType staging_dtype) {
+  api::Context* const context = api::context();
+
+  api::StorageBuffer staging(
+      context, staging_dtype, v_src.gpu_numel(), true);
+
+  utils::pack_vtensor_to_staging(v_src, staging.buffer());
+
+  api::PipelineBarrier pipeline_barrier{};
+  add_buffer_barrier(
+      pipeline_barrier,
+      staging.buffer(),
+      // Previous access
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::WRITE,
+      // Next access
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::READ);
+
+  utils::pack_buffer_to_vtensor(staging.buffer(), v_dst, pipeline_barrier);
+}
+
 void memcpy_to_mapping(const Tensor& src, api::MemoryMap& dst_mapping) {
   if (src.dtype() == at::kFloat) {
     memcpy_to_mapping_impl<float>(src, dst_mapping);
@@ -272,11 +317,34 @@ Tensor& copy_(Tensor& dst, const Tensor& src) {
   if (at::kVulkan == dst.device().type()) {
     vTensor& v_self = convert(dst);
 
-    // Vulkan -> Vulkan
-    if (at::kVulkan == src.device().type()) {
-      vTensor& v_src = convert(src);
+  // Vulkan -> Vulkan
+  if (at::kVulkan == src.device().type()) {
+    vTensor& v_src = convert(src);
+    const bool src_buffer =
+        v_src.storage_type() == api::StorageType::BUFFER;
+    const bool dst_buffer =
+        v_self.storage_type() == api::StorageType::BUFFER;
+
+    if (src_buffer || dst_buffer) {
+      if (v_src.dtype() != v_self.dtype()) {
+        Tensor src_cpu = src.cpu();
+        pack_cpu_to_vulkan(src_cpu, v_self);
+      } else {
+        const bool mixed_storage = src_buffer != dst_buffer;
+        if (mixed_storage && v_src.dtype() != api::kFloat) {
+          Tensor src_cpu = src.cpu();
+          pack_cpu_to_vulkan(src_cpu, v_self);
+        } else {
+          const api::ScalarType staging_dtype =
+              staging_dtype_for_copy(api::context(), v_src, v_self);
+          transfer_vulkan_to_vulkan_staging(
+              v_src, v_self, staging_dtype);
+        }
+      }
+    } else {
       transfer_vulkan_to_vulkan(v_src, v_self);
     }
+  }
     // CPU -> Vulkan
     else {
       pack_cpu_to_vulkan(src, v_self);
