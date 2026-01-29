@@ -1,6 +1,9 @@
 #include <ATen/native/vulkan/ops/Common.h>
+#include <ATen/native/vulkan/ops/Utils.h>
 #include <c10/util/irange.h>
 #include <torch/library.h>
+
+#include <limits>
 
 namespace at {
 namespace native {
@@ -15,6 +18,205 @@ inline int64_t normalize_dim(int64_t d, int64_t n) {
   return (d % n + n) % n;
 }
 } // namespace
+
+struct Int64Extent3D {
+  int64_t width;
+  int64_t height;
+  int64_t depth;
+};
+
+Int64Extent3D estimate_texture_3d_extents(const std::vector<int64_t>& sizes) {
+  const int64_t width = val_at(-1, sizes);
+  const int64_t height = val_at(-2, sizes);
+  const int64_t channels = val_at(-3, sizes);
+  const int64_t batch = val_at(-4, sizes);
+
+  const int64_t aligned_channels = align_up(channels, INT64_C(4));
+  const int64_t packed_channels = aligned_channels / 4;
+
+  int64_t depth = 0;
+  if (packed_channels == 0 || batch == 0) {
+    depth = 0;
+  } else if (batch > std::numeric_limits<int64_t>::max() / packed_channels) {
+    depth = std::numeric_limits<int64_t>::max();
+  } else {
+    depth = batch * packed_channels;
+  }
+
+  return {width, height, depth};
+}
+
+bool exceeds_u32_numel(const IntArrayRef sizes) {
+  const uint64_t u32_max =
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+  uint64_t acc = 1;
+
+  for (const int64_t value : sizes) {
+    if (value < 0) {
+      return true;
+    }
+    if (value == 0) {
+      return false;
+    }
+    const uint64_t v = static_cast<uint64_t>(value);
+    if (v > u32_max || acc > u32_max / v) {
+      return true;
+    }
+    acc *= v;
+  }
+
+  return false;
+}
+
+bool needs_buffer_storage(const IntArrayRef sizes) {
+  if (sizes.size() > 4) {
+    return true;
+  }
+
+  if (exceeds_u32_numel(sizes)) {
+    return true;
+  }
+
+  const Int64Extent3D extents = estimate_texture_3d_extents(sizes.vec());
+  const VkPhysicalDeviceLimits& limits =
+      api::context()->adapter_ptr()->limits();
+  const int64_t u32_max =
+      static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+
+  return extents.width > static_cast<int64_t>(limits.maxImageDimension3D) ||
+      extents.height > static_cast<int64_t>(limits.maxImageDimension3D) ||
+      extents.depth > static_cast<int64_t>(limits.maxImageDimension3D) ||
+      extents.width > u32_max || extents.height > u32_max ||
+      extents.depth > u32_max;
+}
+
+int64_t size_product(const IntArrayRef sizes, int64_t start, int64_t end) {
+  if (start >= end) {
+    return 1;
+  }
+  int64_t acc = 1;
+  for (int64_t i = start; i < end; ++i) {
+    acc *= sizes[i];
+  }
+  return acc;
+}
+
+vTensor to_buffer_tensor(const Tensor& tensor) {
+  api::Context* const context = api::context();
+
+  Tensor vulkan_tensor = tensor.is_vulkan() ? tensor : tensor.vulkan();
+  if (!vulkan_tensor.is_contiguous()) {
+    vulkan_tensor = vulkan_tensor.contiguous();
+  }
+
+  vTensor v_src = convert(vulkan_tensor);
+  if (v_src.storage_type() == api::StorageType::BUFFER) {
+    return v_src;
+  }
+
+  vTensor v_buffer{
+      context,
+      vulkan_tensor.sizes().vec(),
+      v_src.dtype(),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  api::StorageBuffer staging(context, v_src.dtype(), v_src.numel(), true);
+  utils::pack_vtensor_to_staging(v_src, staging.buffer());
+
+  api::PipelineBarrier pipeline_barrier{};
+  add_buffer_barrier(
+      pipeline_barrier,
+      staging.buffer(),
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::WRITE,
+      api::PipelineStage::COMPUTE,
+      api::MemoryAccessType::READ);
+  utils::pack_buffer_to_vtensor(staging.buffer(), v_buffer, pipeline_barrier);
+
+  return v_buffer;
+}
+
+Tensor cat_buffer(
+    const MaterializedITensorListRef& tensors,
+    const int64_t dim,
+    const std::vector<int64_t>& result_size,
+    const c10::ScalarType scalar_type) {
+  api::Context* const context = api::context();
+
+  vTensor v_output{
+      context,
+      result_size,
+      convert_dtype(scalar_type),
+      api::StorageType::BUFFER,
+      api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+  };
+
+  if (v_output.numel() == 0) {
+    return convert(v_output);
+  }
+
+  std::vector<vTensor> v_inputs;
+  v_inputs.reserve(tensors.size());
+  for (const at::Tensor& tensor : tensors) {
+    v_inputs.emplace_back(to_buffer_tensor(tensor));
+  }
+
+  const IntArrayRef out_sizes(result_size);
+  const int64_t ndim = out_sizes.size();
+  const int64_t inner = size_product(out_sizes, dim + 1, ndim);
+  const int64_t outer = size_product(out_sizes, 0, dim);
+  const int64_t total_dim = out_sizes[dim];
+
+  const VkDeviceSize element_bytes = static_cast<VkDeviceSize>(
+      v_output.nbytes() / v_output.numel());
+
+  int64_t running_dim = 0;
+  for (const vTensor& v_input : v_inputs) {
+    TORCH_CHECK(
+        v_input.dtype() == v_output.dtype(),
+        "Vulkan buffer cat requires matching dtypes.");
+
+    const int64_t dim_size = v_input.sizes().at(dim);
+    const int64_t slice_elems = dim_size * inner;
+    if (slice_elems == 0) {
+      running_dim += dim_size;
+      continue;
+    }
+
+    const VkDeviceSize copy_bytes =
+        element_bytes * static_cast<VkDeviceSize>(slice_elems);
+
+    for (int64_t outer_idx = 0; outer_idx < outer; ++outer_idx) {
+      const int64_t src_elem_offset = outer_idx * slice_elems;
+      const int64_t dst_elem_offset =
+          outer_idx * total_dim * inner + running_dim * inner;
+
+      const VkDeviceSize src_offset_bytes =
+          element_bytes * static_cast<VkDeviceSize>(src_elem_offset);
+      const VkDeviceSize dst_offset_bytes =
+          element_bytes * static_cast<VkDeviceSize>(dst_elem_offset);
+
+      api::PipelineBarrier pipeline_barrier{};
+      context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
+          pipeline_barrier,
+          v_input.buffer(pipeline_barrier, api::PipelineStage::TRANSFER),
+          v_output.buffer(
+              pipeline_barrier,
+              api::PipelineStage::TRANSFER,
+              api::MemoryAccessType::WRITE),
+          {safe_downcast<uint32_t>(copy_bytes), 0u, 0u},
+          {safe_downcast<uint32_t>(src_offset_bytes), 0u, 0u},
+          {safe_downcast<uint32_t>(dst_offset_bytes), 0u, 0u},
+          VK_NULL_HANDLE);
+    }
+
+    running_dim += dim_size;
+  }
+
+  return convert(v_output);
+}
 
 Tensor cat_batch(const MaterializedITensorListRef& tensors, vTensor& v_output) {
   api::Context* const context = api::context();
@@ -304,6 +506,22 @@ Tensor cat(const at::ITensorListRef& tensors, const int64_t in_dim) {
   auto result_size = tensor.sizes().vec();
   TORCH_INTERNAL_ASSERT(!result_size.empty(), "Accessing empty array");
   result_size[dim] = cat_dim_size;
+
+  const bool output_needs_buffer = needs_buffer_storage(result_size);
+  bool any_buffer = false;
+  if (!output_needs_buffer) {
+    for (const at::Tensor& t : materialized) {
+      if (t.is_vulkan() &&
+          convert(t).storage_type() == api::StorageType::BUFFER) {
+        any_buffer = true;
+        break;
+      }
+    }
+  }
+
+  if (output_needs_buffer || any_buffer) {
+    return cat_buffer(materialized, dim, result_size, tensor.scalar_type());
+  }
 
   vTensor v_output{
       api::context(), result_size, convert_dtype(tensor.scalar_type())};
