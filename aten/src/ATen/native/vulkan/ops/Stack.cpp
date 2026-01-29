@@ -1,4 +1,5 @@
 #include <ATen/native/vulkan/ops/Common.h>
+#include <ATen/native/vulkan/ops/Copy.h>
 #include <ATen/native/vulkan/ops/Utils.h>
 
 #include <limits>
@@ -114,6 +115,11 @@ vTensor to_buffer_tensor(const Tensor& tensor) {
   vTensor v_src = convert(vulkan_tensor);
   if (v_src.storage_type() == api::StorageType::BUFFER) {
     return v_src;
+  }
+
+  if (v_src.dtype() == api::kHalf) {
+    Tensor src_cpu = vulkan_tensor.cpu();
+    return ops::to_vulkan(src_cpu, api::StorageType::BUFFER);
   }
 
   vTensor v_buffer{

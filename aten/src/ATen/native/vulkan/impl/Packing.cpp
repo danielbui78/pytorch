@@ -55,7 +55,7 @@ api::ShaderInfo get_nchw_to_image_shader(const vTensor& v_dst) {
     }
   }
 
-  if (v_dst.dtype() == api::kFloat) {
+  if (v_dst.dtype() == api::kFloat || v_dst.dtype() == api::kHalf) {
     switch (v_dst.storage_type()) {
       case api::StorageType::TEXTURE_3D:
         return VK_KERNEL(nchw_to_image);
@@ -103,7 +103,7 @@ api::ShaderInfo get_image_to_nchw_shader(const vTensor& v_src) {
     }
   }
 
-  if (v_src.dtype() == api::kFloat) {
+  if (v_src.dtype() == api::kFloat || v_src.dtype() == api::kHalf) {
     switch (v_src.storage_type()) {
       case api::StorageType::TEXTURE_3D:
         return VK_KERNEL(image_to_nchw);
