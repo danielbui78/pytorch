@@ -48,6 +48,13 @@ binary_op_tensor:
 binary_op_tensor_buffer:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
   shader_variants:
     - NAME: add_buffer
       OPERATOR: X + A * Y
@@ -65,6 +72,13 @@ binary_op_tensor_buffer:
 binary_op_tensor_buffer_f16:
   parameter_names_with_default_values:
     OPERATOR: X + A * Y
+    INPLACE: false
+  generate_variant_forall:
+    INPLACE:
+      - VALUE: false
+        SUFFIX: ""
+      - VALUE: true
+        SUFFIX: inplace
   shader_variants:
     - NAME: add_buffer_f16
       OPERATOR: X + A * Y

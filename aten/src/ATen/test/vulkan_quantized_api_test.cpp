@@ -419,6 +419,201 @@ TEST_F(VulkanAPITest, copy_to_buffer_channels_last) {
   }
 }
 
+namespace {
+
+enum class BufferBinaryInplaceOp {
+  Add,
+  Sub,
+  Mul,
+  Div,
+  Pow,
+  FloorDivide,
+};
+
+const char* buffer_binary_op_name(const BufferBinaryInplaceOp op) {
+  switch (op) {
+    case BufferBinaryInplaceOp::Add:
+      return "add_";
+    case BufferBinaryInplaceOp::Sub:
+      return "sub_";
+    case BufferBinaryInplaceOp::Mul:
+      return "mul_";
+    case BufferBinaryInplaceOp::Div:
+      return "div_";
+    case BufferBinaryInplaceOp::Pow:
+      return "pow_";
+    case BufferBinaryInplaceOp::FloorDivide:
+      return "floor_divide_";
+  }
+  return "unknown";
+}
+
+at::Tensor to_buffer_vulkan_tensor(const at::Tensor& in_cpu) {
+  at::Tensor src = in_cpu.contiguous(in_cpu.suggest_memory_format());
+  vTensor v_src = ops::to_vulkan(src, api::StorageType::BUFFER);
+  return ops::convert(v_src);
+}
+
+void apply_inplace_binary_op_cpu(
+    at::Tensor& self,
+    const at::Tensor& other,
+    const BufferBinaryInplaceOp op) {
+  switch (op) {
+    case BufferBinaryInplaceOp::Add:
+      self.add_(other, 0.7f);
+      break;
+    case BufferBinaryInplaceOp::Sub:
+      self.sub_(other, 0.7f);
+      break;
+    case BufferBinaryInplaceOp::Mul:
+      self.mul_(other);
+      break;
+    case BufferBinaryInplaceOp::Div:
+      self.div_(other);
+      break;
+    case BufferBinaryInplaceOp::Pow:
+      self.pow_(other);
+      break;
+    case BufferBinaryInplaceOp::FloorDivide:
+      self.floor_divide_(other);
+      break;
+  }
+}
+
+void apply_inplace_binary_op_vulkan(
+    at::Tensor& self,
+    const at::Tensor& other,
+    const BufferBinaryInplaceOp op) {
+  switch (op) {
+    case BufferBinaryInplaceOp::Add:
+      self.add_(other, 0.7f);
+      break;
+    case BufferBinaryInplaceOp::Sub:
+      self.sub_(other, 0.7f);
+      break;
+    case BufferBinaryInplaceOp::Mul:
+      self.mul_(other);
+      break;
+    case BufferBinaryInplaceOp::Div:
+      self.div_(other);
+      break;
+    case BufferBinaryInplaceOp::Pow:
+      self.pow_(other);
+      break;
+    case BufferBinaryInplaceOp::FloorDivide:
+      self.floor_divide_(other);
+      break;
+  }
+}
+
+bool tensor_close_for_dtype(
+    const at::Tensor& expected,
+    const at::Tensor& actual,
+    const c10::ScalarType dtype) {
+  if (dtype == c10::kHalf) {
+    return at::allclose(expected, actual, 1e-2, 1e-2);
+  }
+  return almostEqual(expected, actual);
+}
+
+void run_buffer_binary_inplace_test_case(
+    const BufferBinaryInplaceOp op,
+    const c10::ScalarType dtype,
+    const bool broadcast_other) {
+  const auto options = at::device(at::kCPU).dtype(at::kFloat);
+  const std::vector<int64_t> self_shape = {3, 4, 5, 6};
+  const std::vector<int64_t> other_shape =
+      broadcast_other ? std::vector<int64_t>({1, 4, 1, 6})
+                      : std::vector<int64_t>({3, 4, 5, 6});
+
+  at::Tensor self_cpu = at::rand(self_shape, options);
+  at::Tensor other_cpu = at::rand(other_shape, options);
+
+  // Use value ranges that avoid NaN/Inf and divide-by-zero edge cases.
+  self_cpu = self_cpu * 2.0f - 1.0f;
+  other_cpu = other_cpu * 2.0f - 1.0f;
+  if (op == BufferBinaryInplaceOp::Div ||
+      op == BufferBinaryInplaceOp::FloorDivide) {
+    other_cpu = other_cpu.abs() + 0.25f;
+  } else if (op == BufferBinaryInplaceOp::Pow) {
+    self_cpu = self_cpu.abs() + 0.1f;
+    other_cpu = other_cpu.abs() * 2.0f + 0.25f;
+  }
+
+  if (dtype == c10::kHalf) {
+    self_cpu = self_cpu.to(c10::kHalf);
+    other_cpu = other_cpu.to(c10::kHalf);
+  }
+
+  at::Tensor expected = self_cpu.clone();
+  at::Tensor actual = to_buffer_vulkan_tensor(self_cpu);
+  at::Tensor other_vulkan = to_buffer_vulkan_tensor(other_cpu);
+
+  ASSERT_TRUE(actual.is_vulkan());
+  ASSERT_TRUE(other_vulkan.is_vulkan());
+  ASSERT_EQ(ops::convert(actual).storage_type(), api::StorageType::BUFFER);
+  ASSERT_EQ(
+      ops::convert(other_vulkan).storage_type(), api::StorageType::BUFFER);
+
+  for (int i = 0; i < 3; ++i) {
+    apply_inplace_binary_op_cpu(expected, other_cpu, op);
+    apply_inplace_binary_op_vulkan(actual, other_vulkan, op);
+
+    const at::Tensor actual_cpu = actual.cpu();
+    const bool check = tensor_close_for_dtype(expected, actual_cpu, dtype);
+    if (!check) {
+      std::cout << "buffer inplace op mismatch: " << buffer_binary_op_name(op)
+                << " dtype=" << static_cast<int>(dtype)
+                << " broadcast_other=" << broadcast_other << std::endl;
+      showRtol(expected, actual_cpu);
+    }
+    ASSERT_TRUE(check);
+
+    // Probe a follow-up op to catch latent corruption after in-place update.
+    const at::Tensor probe_expected = at::mean(expected);
+    const at::Tensor probe_actual = at::mean(actual).cpu();
+    ASSERT_TRUE(tensor_close_for_dtype(probe_expected, probe_actual, dtype));
+  }
+}
+
+} // namespace
+
+TEST_F(VulkanAPITest, buffer_binary_inplace_float32) {
+  const std::array<BufferBinaryInplaceOp, 6> ops = {
+      BufferBinaryInplaceOp::Add,
+      BufferBinaryInplaceOp::Sub,
+      BufferBinaryInplaceOp::Mul,
+      BufferBinaryInplaceOp::Div,
+      BufferBinaryInplaceOp::Pow,
+      BufferBinaryInplaceOp::FloorDivide,
+  };
+
+  for (const auto op : ops) {
+    run_buffer_binary_inplace_test_case(op, c10::kFloat, false);
+    run_buffer_binary_inplace_test_case(op, c10::kFloat, true);
+  }
+}
+
+TEST_F(VulkanAPITest, buffer_binary_inplace_float16) {
+  if (!api::context()->fp16_buffer_storage_enabled()) {
+    GTEST_SKIP() << "FP16 buffer storage is disabled";
+  }
+
+  const std::array<BufferBinaryInplaceOp, 6> ops = {
+      BufferBinaryInplaceOp::Add,
+      BufferBinaryInplaceOp::Sub,
+      BufferBinaryInplaceOp::Mul,
+      BufferBinaryInplaceOp::Div,
+      BufferBinaryInplaceOp::Pow,
+      BufferBinaryInplaceOp::FloorDivide,
+  };
+
+  for (const auto op : ops) {
+    run_buffer_binary_inplace_test_case(op, c10::kHalf, false);
+    run_buffer_binary_inplace_test_case(op, c10::kHalf, true);
+  }
+}
+
 // TODO: Fix vulkan to cpu on Android
 TEST_F(VulkanAPITest, DISABLED_support_vulkan) {
   const double scale = 0.1;

@@ -458,8 +458,8 @@ static Tensor& binary_op_tensor_(
     const Tensor& other_arg,
     const std::optional<Scalar>& alpha_arg,
     const api::ShaderInfo& shader_descriptor,
-    const api::ShaderInfo& buffer_shader_descriptor,
-    const api::ShaderInfo& buffer_shader_descriptor_f16) {
+    const api::ShaderInfo& buffer_inplace_shader_descriptor,
+    const api::ShaderInfo& buffer_inplace_shader_descriptor_f16) {
   TORCH_CHECK(
       get_dim<Dim4D::Batch>(self_arg) >= get_dim<Dim4D::Batch>(other_arg) &&
           get_dim<Dim4D::Channel>(self_arg) >=
@@ -517,8 +517,10 @@ static Tensor& binary_op_tensor_(
         api::PipelineStage::COMPUTE,
         api::MemoryAccessType::READ | api::MemoryAccessType::WRITE);
 
-    const api::ShaderInfo& buffer_shader =
-        select_buffer_shader(v_self, buffer_shader_descriptor, buffer_shader_descriptor_f16);
+    const api::ShaderInfo& buffer_shader = select_buffer_shader(
+        v_self,
+        buffer_inplace_shader_descriptor,
+        buffer_inplace_shader_descriptor_f16);
 
     context->submit_compute_job(
         // shader descriptor
@@ -532,8 +534,6 @@ static Tensor& binary_op_tensor_(
         // fence handle
         VK_NULL_HANDLE,
         // shader arguments
-        self_buffer,
-        v_self.buffer_metadata(),
         self_buffer,
         v_self.buffer_metadata(),
         v_other.buffer(pipeline_barrier, api::PipelineStage::COMPUTE),
@@ -667,8 +667,8 @@ static Tensor& add_tensor_(
       other_arg,
       std::optional<Scalar>(alpha),
       VK_KERNEL(add_inplace),
-      VK_KERNEL(add_buffer),
-      VK_KERNEL(add_buffer_f16));
+      VK_KERNEL(add_buffer_inplace),
+      VK_KERNEL(add_buffer_f16_inplace));
 }
 
 static Tensor sub_scalar(
@@ -715,8 +715,8 @@ static Tensor& sub_tensor_(
       other_arg,
       std::optional<Scalar>(alpha),
       VK_KERNEL(sub_inplace),
-      VK_KERNEL(sub_buffer),
-      VK_KERNEL(sub_buffer_f16));
+      VK_KERNEL(sub_buffer_inplace),
+      VK_KERNEL(sub_buffer_f16_inplace));
 }
 
 static Tensor mul_scalar(const Tensor& self_arg, const Scalar& other) {
@@ -745,8 +745,8 @@ static Tensor& mul_tensor_(Tensor& self, const Tensor& other_arg) {
       other_arg,
       std::optional<Scalar>(),
       VK_KERNEL(mul_inplace),
-      VK_KERNEL(mul_buffer),
-      VK_KERNEL(mul_buffer_f16));
+      VK_KERNEL(mul_buffer_inplace),
+      VK_KERNEL(mul_buffer_f16_inplace));
 }
 
 static Tensor div_scalar(const Tensor& self_arg, const Scalar& other) {
@@ -781,8 +781,8 @@ static Tensor& div_tensor_(Tensor& self, const Tensor& other_arg) {
       other_arg,
       std::optional<Scalar>(),
       VK_KERNEL(div_inplace),
-      VK_KERNEL(div_buffer),
-      VK_KERNEL(div_buffer_f16));
+      VK_KERNEL(div_buffer_inplace),
+      VK_KERNEL(div_buffer_f16_inplace));
 }
 
 static Tensor pow(const Tensor& self, const Tensor& other) {
@@ -801,8 +801,8 @@ static Tensor& pow_(Tensor& self, const Tensor& other) {
       other,
       std::optional<Scalar>(),
       VK_KERNEL(pow_inplace),
-      VK_KERNEL(pow_buffer),
-      VK_KERNEL(pow_buffer_f16));
+      VK_KERNEL(pow_buffer_inplace),
+      VK_KERNEL(pow_buffer_f16_inplace));
 }
 
 static Tensor pow_tensor_scalar(const Tensor& self, const Scalar& other) {
@@ -891,8 +891,8 @@ static Tensor& floor_divide_tensor_(Tensor& self, const Tensor& other_arg) {
       other_arg,
       std::optional<Scalar>(),
       VK_KERNEL(floor_divide_inplace),
-      VK_KERNEL(floor_divide_buffer),
-      VK_KERNEL(floor_divide_buffer_f16));
+      VK_KERNEL(floor_divide_buffer_inplace),
+      VK_KERNEL(floor_divide_buffer_f16_inplace));
 }
 
 static Tensor eq_scalar(const Tensor& self_arg, const Scalar& other) {
