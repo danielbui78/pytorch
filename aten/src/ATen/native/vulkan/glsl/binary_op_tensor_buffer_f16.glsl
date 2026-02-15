@@ -145,7 +145,6 @@ void main() {
 
   const uvec4 write_coord =
       idx_to_coord(write_idx, logical_strides, uOutMeta.sizes);
-  const uint out_idx = coord_to_idx(write_coord, uOutMeta.strides);
 
   uvec4 other_coord = write_coord;
   other_coord.x = (uOtherMeta.sizes.x == 1u) ? 0u : other_coord.x;
@@ -153,7 +152,10 @@ void main() {
   other_coord.z = (uOtherMeta.sizes.z == 1u) ? 0u : other_coord.z;
   other_coord.w = (uOtherMeta.sizes.w == 1u) ? 0u : other_coord.w;
 
-  const uint other_idx = coord_to_idx(other_coord, uOtherMeta.strides);
+  const bool other_same_shape = all(equal(uOtherMeta.sizes, uOutMeta.sizes));
+  const uint other_idx = other_same_shape
+      ? write_idx
+      : coord_to_idx(other_coord, uOtherMeta.strides);
   const float other_val = float(uOther.data[other_idx]);
   // clang-format off
   $if not INPLACE:
@@ -162,11 +164,14 @@ void main() {
     in_coord.y = (uInMeta.sizes.y == 1u) ? 0u : in_coord.y;
     in_coord.z = (uInMeta.sizes.z == 1u) ? 0u : in_coord.z;
     in_coord.w = (uInMeta.sizes.w == 1u) ? 0u : in_coord.w;
-    const uint in_idx = coord_to_idx(in_coord, uInMeta.strides);
+    const bool in_same_shape = all(equal(uInMeta.sizes, uOutMeta.sizes));
+    const uint in_idx = in_same_shape
+        ? write_idx
+        : coord_to_idx(in_coord, uInMeta.strides);
     const float in_val = float(uInput.data[in_idx]);
   $else:
-    const float in_val = float(uOutput.data[out_idx]);
+    const float in_val = float(uOutput.data[write_idx]);
   // clang-format on
-  uOutput.data[out_idx] =
+  uOutput.data[write_idx] =
       float16_t(OP(in_val, other_val, uParams.alpha.x));
 }
