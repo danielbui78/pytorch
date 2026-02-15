@@ -141,6 +141,7 @@ void main() {
 
   const uvec4 write_coord =
       idx_to_coord(write_idx, logical_strides, uOutMeta.sizes);
+  const uint out_idx = coord_to_idx(write_coord, uOutMeta.strides);
 
   uvec4 other_coord = write_coord;
   other_coord.x = (uOtherMeta.sizes.x == 1u) ? 0u : other_coord.x;
@@ -160,7 +161,7 @@ void main() {
     const uint in_idx = coord_to_idx(in_coord, uInMeta.strides);
     const float in_val = uInput.data[in_idx];
   $else:
-    const float in_val = uOutput.data[write_idx];
+    const float in_val = uOutput.data[out_idx];
   // clang-format on
-  uOutput.data[write_idx] = OP(in_val, other_val, uParams.alpha.x);
+  uOutput.data[out_idx] = OP(in_val, other_val, uParams.alpha.x);
 }
