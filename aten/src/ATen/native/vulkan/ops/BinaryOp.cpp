@@ -662,6 +662,13 @@ static Tensor& add_tensor_(
     Tensor& self,
     const Tensor& other_arg,
     const Scalar& alpha) {
+  if (self.is_vulkan()) {
+    // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
+    // back into self.
+    Tensor out = add_tensor(self, other_arg, alpha);
+    self.copy_(out);
+    return self;
+  }
   return binary_op_tensor_(
       self,
       other_arg,
@@ -710,6 +717,13 @@ static Tensor& sub_tensor_(
     Tensor& self,
     const Tensor& other_arg,
     const Scalar& alpha) {
+  if (self.is_vulkan()) {
+    // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
+    // back into self.
+    Tensor out = sub_tensor(self, other_arg, alpha);
+    self.copy_(out);
+    return self;
+  }
   return binary_op_tensor_(
       self,
       other_arg,
@@ -740,6 +754,13 @@ static Tensor mul_tensor(const Tensor& self_arg, const Tensor& other_arg) {
 }
 
 static Tensor& mul_tensor_(Tensor& self, const Tensor& other_arg) {
+  if (self.is_vulkan()) {
+    // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
+    // back into self.
+    Tensor out = mul_tensor(self, other_arg);
+    self.copy_(out);
+    return self;
+  }
   return binary_op_tensor_(
       self,
       other_arg,
@@ -776,6 +797,13 @@ static Tensor div_tensor(const Tensor& self_arg, const Tensor& other_arg) {
 }
 
 static Tensor& div_tensor_(Tensor& self, const Tensor& other_arg) {
+  if (self.is_vulkan()) {
+    // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
+    // back into self.
+    Tensor out = div_tensor(self, other_arg);
+    self.copy_(out);
+    return self;
+  }
   return binary_op_tensor_(
       self,
       other_arg,
@@ -796,6 +824,13 @@ static Tensor pow(const Tensor& self, const Tensor& other) {
 }
 
 static Tensor& pow_(Tensor& self, const Tensor& other) {
+  if (self.is_vulkan()) {
+    // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
+    // back into self.
+    Tensor out = pow(self, other);
+    self.copy_(out);
+    return self;
+  }
   return binary_op_tensor_(
       self,
       other,
@@ -871,6 +906,13 @@ static Tensor floor_divide_tensor(const Tensor& self, const Tensor& other) {
 }
 
 static Tensor& floor_divide_tensor_(Tensor& self, const Tensor& other_arg) {
+  if (self.is_vulkan()) {
+    // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
+    // back into self.
+    Tensor out = floor_divide_tensor(self, other_arg);
+    self.copy_(out);
+    return self;
+  }
   if (self.is_vulkan()) {
     const Tensor other = other_arg.is_vulkan() ? other_arg : other_arg.vulkan();
     vTensor& v_self = convert(self);
