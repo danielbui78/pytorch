@@ -302,7 +302,7 @@ bool record_buffer_to_nchw_op(
       v_src.buffer(
           pipeline_barrier,
           api::PipelineStage::COMPUTE,
-          api::MemoryAccessType::WRITE),
+          api::MemoryAccessType::READ),
       v_src.buffer_metadata());
 }
 
