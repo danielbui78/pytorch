@@ -64,40 +64,6 @@ static void transfer_vulkan_to_vulkan_staging(
   utils::pack_buffer_to_vtensor(staging.buffer(), v_dst, pipeline_barrier);
 }
 
-static void transfer_vulkan_buffer_to_buffer(vTensor& v_src, vTensor& v_dst) {
-  api::Context* const context = api::context();
-
-  TORCH_CHECK(
-      v_src.storage_type() == api::StorageType::BUFFER &&
-          v_dst.storage_type() == api::StorageType::BUFFER,
-      "Vulkan buffer-to-buffer copy requires both tensors to be buffer-backed.");
-
-  api::PipelineBarrier pipeline_barrier{};
-  api::VulkanBuffer& src_buffer =
-      v_src.buffer(pipeline_barrier, api::PipelineStage::TRANSFER);
-  api::VulkanBuffer& dst_buffer = v_dst.buffer(
-      pipeline_barrier,
-      api::PipelineStage::TRANSFER,
-      api::MemoryAccessType::WRITE);
-
-  TORCH_CHECK(
-      src_buffer.mem_size() == dst_buffer.mem_size(),
-      "Vulkan buffer-to-buffer copy requires source/destination byte sizes to match.");
-
-  context->submit_copy<api::VulkanBuffer, api::VulkanBuffer>(
-      // pipeline barrier
-      pipeline_barrier,
-      // buffers
-      src_buffer,
-      dst_buffer,
-      // copy details
-      {api::utils::safe_downcast<uint32_t>(src_buffer.mem_size()), 0u, 0u},
-      {0u, 0u, 0u},
-      {0u, 0u, 0u},
-      // fence handle
-      VK_NULL_HANDLE);
-}
-
 void memcpy_to_mapping(const Tensor& src, api::MemoryMap& dst_mapping) {
   if (src.dtype() == at::kFloat) {
     memcpy_to_mapping_impl<float>(src, dst_mapping);
@@ -363,8 +329,6 @@ Tensor& copy_(Tensor& dst, const Tensor& src) {
       if (v_src.dtype() != v_self.dtype()) {
         Tensor src_cpu = src.cpu();
         pack_cpu_to_vulkan(src_cpu, v_self);
-      } else if (src_buffer && dst_buffer) {
-        transfer_vulkan_buffer_to_buffer(v_src, v_self);
       } else {
         const bool mixed_storage = src_buffer != dst_buffer;
         if (mixed_storage && v_src.dtype() != api::kFloat) {
