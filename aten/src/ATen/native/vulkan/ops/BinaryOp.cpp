@@ -10,6 +10,10 @@
 #include <ATen/ops/eq.h>
 #include <ATen/ops/floor_divide.h>
 #endif
+#include <atomic>
+#include <cstdlib>
+#include <iostream>
+#include <mutex>
 #include <torch/library.h>
 
 namespace at {
@@ -73,6 +77,179 @@ static Tensor to_texture_tensor(const Tensor& src_arg) {
   Tensor src_contig = src_cpu.contiguous(src_cpu.suggest_memory_format());
   vTensor v_texture = ops::to_vulkan(src_contig, api::StorageType::TEXTURE_3D);
   return convert(v_texture);
+}
+
+inline bool binaryop_trace_enabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("PYTORCH_VULKAN_BINARYOP_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+inline int64_t binaryop_trace_limit() {
+  static const int64_t limit = []() -> int64_t {
+    const char* value = std::getenv("PYTORCH_VULKAN_BINARYOP_TRACE_LIMIT");
+    if (value == nullptr || value[0] == '\0') {
+      return 400;
+    }
+    const long parsed = std::strtol(value, nullptr, 10);
+    return parsed > 0 ? parsed : 400;
+  }();
+  return limit;
+}
+
+inline int64_t next_binaryop_trace_id() {
+  static std::atomic<int64_t> seq{0};
+  return ++seq;
+}
+
+inline bool update_trace_enabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("PYTORCH_VULKAN_UPDATE_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+inline int64_t next_update_trace_id() {
+  static std::atomic<int64_t> seq{0};
+  return ++seq;
+}
+
+inline int64_t parse_positive_int_env(
+    const char* env_name,
+    const int64_t default_value) {
+  const char* value = std::getenv(env_name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+  const long parsed = std::strtol(value, nullptr, 10);
+  return parsed > 0 ? parsed : default_value;
+}
+
+inline int64_t update_guard_force_cpu_copy_at() {
+  static const int64_t guard_at = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_GUARD_FORCE_CPU_COPY_AT",
+      -1);
+  return guard_at;
+}
+
+inline int64_t update_guard_force_cpu_copy_start() {
+  static const int64_t guard_start = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_GUARD_FORCE_CPU_COPY_START",
+      -1);
+  return guard_start;
+}
+
+inline int64_t update_guard_force_cpu_copy_end() {
+  static const int64_t guard_end = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_GUARD_FORCE_CPU_COPY_END",
+      -1);
+  return guard_end;
+}
+
+inline bool should_force_cpu_copy_for_update_id(const int64_t update_id) {
+  const int64_t guard_at = update_guard_force_cpu_copy_at();
+  if (guard_at > 0 && update_id == guard_at) {
+    return true;
+  }
+
+  const int64_t guard_start = update_guard_force_cpu_copy_start();
+  if (guard_start <= 0 || update_id < guard_start) {
+    return false;
+  }
+
+  const int64_t guard_end = update_guard_force_cpu_copy_end();
+  if (guard_end > 0 && guard_end < guard_start) {
+    return false;
+  }
+  return guard_end <= 0 || update_id <= guard_end;
+}
+
+inline int64_t update_ordering_probe_flush_at() {
+  static const int64_t guard_at = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_ORDERING_PROBE_FLUSH_AT",
+      -1);
+  return guard_at;
+}
+
+inline int64_t update_ordering_probe_flush_start() {
+  static const int64_t guard_start = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_ORDERING_PROBE_FLUSH_START",
+      -1);
+  return guard_start;
+}
+
+inline int64_t update_ordering_probe_flush_end() {
+  static const int64_t guard_end = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_ORDERING_PROBE_FLUSH_END",
+      -1);
+  return guard_end;
+}
+
+inline bool should_run_ordering_probe_flush_for_update_id(
+    const int64_t update_id) {
+  const int64_t guard_at = update_ordering_probe_flush_at();
+  if (guard_at > 0 && update_id == guard_at) {
+    return true;
+  }
+
+  const int64_t guard_start = update_ordering_probe_flush_start();
+  if (guard_start <= 0 || update_id < guard_start) {
+    return false;
+  }
+
+  const int64_t guard_end = update_ordering_probe_flush_end();
+  if (guard_end > 0 && guard_end < guard_start) {
+    return false;
+  }
+  return guard_end <= 0 || update_id <= guard_end;
+}
+
+thread_local bool g_update_guard_armed_for_add_tensor = false;
+thread_local bool g_update_guard_force_cpu_copy_next = false;
+thread_local int64_t g_update_ordering_probe_flush_update_id = -1;
+
+struct UpdateGuardArm final {
+  UpdateGuardArm() {
+    g_update_guard_armed_for_add_tensor = true;
+  }
+  ~UpdateGuardArm() {
+    g_update_guard_armed_for_add_tensor = false;
+  }
+};
+
+inline void arm_update_guard_force_cpu_copy_next() {
+  g_update_guard_force_cpu_copy_next = true;
+}
+
+inline bool consume_update_guard_force_cpu_copy_next() {
+  const bool should_force = g_update_guard_force_cpu_copy_next;
+  g_update_guard_force_cpu_copy_next = false;
+  return should_force;
+}
+
+inline void arm_update_ordering_probe_flush_after_copy(
+    const int64_t update_id) {
+  g_update_ordering_probe_flush_update_id = update_id;
+}
+
+inline int64_t consume_update_ordering_probe_flush_after_copy() {
+  const int64_t update_id = g_update_ordering_probe_flush_update_id;
+  g_update_ordering_probe_flush_update_id = -1;
+  return update_id;
+}
+
+inline const char* storage_type_name(const api::StorageType storage_type) {
+  switch (storage_type) {
+    case api::StorageType::BUFFER:
+      return "BUFFER";
+    case api::StorageType::TEXTURE_3D:
+      return "TEXTURE_3D";
+    default:
+      return "OTHER";
+  }
 }
 
 } // namespace
@@ -231,6 +408,18 @@ static Tensor binary_op_tensor(
   vTensor& v_other_raw = convert(other);
   const bool any_buffer = v_self_raw.storage_type() == api::StorageType::BUFFER ||
       v_other_raw.storage_type() == api::StorageType::BUFFER;
+  const int64_t trace_id =
+      binaryop_trace_enabled() ? next_binaryop_trace_id() : -1;
+  if (trace_id > 0 && trace_id <= binaryop_trace_limit()) {
+    std::cerr << "[vk_binaryop_trace] id=" << trace_id
+              << " site=binary_op_tensor.entry any_buffer=" << any_buffer
+              << " self_storage=" << storage_type_name(v_self_raw.storage_type())
+              << " other_storage=" << storage_type_name(v_other_raw.storage_type())
+              << " self_dtype=" << static_cast<int>(v_self_raw.dtype())
+              << " other_dtype=" << static_cast<int>(v_other_raw.dtype())
+              << " self_numel=" << self.numel() << " other_numel=" << other.numel()
+              << "\n";
+  }
 
   if (any_buffer) {
     if (v_self_raw.storage_type() != api::StorageType::BUFFER) {
@@ -277,6 +466,14 @@ static Tensor binary_op_tensor(
 
     const api::ShaderInfo& buffer_shader =
         select_buffer_shader(v_self, buffer_shader_descriptor, buffer_shader_descriptor_f16);
+    if (trace_id > 0 && trace_id <= binaryop_trace_limit()) {
+      std::cerr << "[vk_binaryop_trace] id=" << trace_id
+                << " site=binary_op_tensor.buffer self_storage="
+                << storage_type_name(v_self.storage_type())
+                << " other_storage=" << storage_type_name(v_other.storage_type())
+                << " use_f16_shader=" << (v_self.dtype() == api::kHalf)
+                << " out_numel=" << v_output.gpu_numel() << "\n";
+    }
 
     context->submit_compute_job(
         // shader descriptor
@@ -306,6 +503,11 @@ static Tensor binary_op_tensor(
 
   vTensor& v_self = v_self_raw;
   vTensor& v_other = v_other_raw;
+  if (trace_id > 0 && trace_id <= binaryop_trace_limit()) {
+    std::cerr << "[vk_binaryop_trace] id=" << trace_id
+              << " site=binary_op_tensor.texture self_numel=" << self.numel()
+              << " other_numel=" << other.numel() << "\n";
+  }
 
   vTensor v_output{
       context,
@@ -649,6 +851,35 @@ static Tensor add_tensor(
     const Tensor& self_arg,
     const Tensor& other_arg,
     const Scalar& alpha) {
+  const bool traced_update =
+      self_arg.is_vulkan() && other_arg.is_vulkan() && alpha.to<float>() <= 0.0f;
+  if (traced_update) {
+    const int64_t update_id = next_update_trace_id();
+    const bool cpu_guard_hit = g_update_guard_armed_for_add_tensor &&
+        should_force_cpu_copy_for_update_id(update_id);
+    const bool ordering_probe_hit = g_update_guard_armed_for_add_tensor &&
+        should_run_ordering_probe_flush_for_update_id(update_id);
+    if (cpu_guard_hit) {
+      arm_update_guard_force_cpu_copy_next();
+      std::cerr << "[vk_update_guard] id=" << update_id
+                << " site=add_tensor action=force_cpu_copy\n";
+    }
+    if (ordering_probe_hit) {
+      arm_update_ordering_probe_flush_after_copy(update_id);
+      std::cerr << "[vk_update_ordering_probe] id=" << update_id
+                << " site=add_tensor action=arm_flush_after_copy\n";
+    }
+    if (update_trace_enabled()) {
+      const bool guard_hit = cpu_guard_hit || ordering_probe_hit;
+      std::cerr << "[vk_update_trace] id=" << update_id
+                << " site=add_tensor alpha=" << alpha.to<float>()
+                << " self_numel=" << self_arg.numel()
+                << " other_numel=" << other_arg.numel()
+                << " guard_hit=" << guard_hit
+                << " guard_cpu_hit=" << cpu_guard_hit
+                << " guard_flush_hit=" << ordering_probe_hit << "\n";
+    }
+  }
   return binary_op_tensor(
       self_arg,
       other_arg,
@@ -663,10 +894,47 @@ static Tensor& add_tensor_(
     const Tensor& other_arg,
     const Scalar& alpha) {
   if (self.is_vulkan()) {
+    const int64_t trace_id =
+        binaryop_trace_enabled() ? next_binaryop_trace_id() : -1;
+    if (trace_id > 0 && trace_id <= binaryop_trace_limit()) {
+      const vTensor& v_self = convert(self);
+      std::cerr << "[vk_binaryop_trace] id=" << trace_id
+                << " site=add_tensor_.entry alpha=" << alpha.to<float>()
+                << " self_storage=" << storage_type_name(v_self.storage_type())
+                << " self_dtype=" << static_cast<int>(v_self.dtype())
+                << " self_numel=" << self.numel()
+                << " other_is_vulkan=" << other_arg.is_vulkan() << "\n";
+    }
     // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
     // back into self.
+    UpdateGuardArm guard_scope{};
     Tensor out = add_tensor(self, other_arg, alpha);
-    self.copy_(out);
+    const bool force_cpu_copy = consume_update_guard_force_cpu_copy_next();
+    const int64_t ordering_flush_update_id =
+        consume_update_ordering_probe_flush_after_copy();
+    if (trace_id > 0 && trace_id <= binaryop_trace_limit()) {
+      const vTensor& v_out = convert(out);
+      std::cerr << "[vk_binaryop_trace] id=" << trace_id
+                << " site=add_tensor_.after_add out_storage="
+                << storage_type_name(v_out.storage_type())
+                << " out_dtype=" << static_cast<int>(v_out.dtype())
+                << " out_numel=" << out.numel() << "\n";
+    }
+    if (force_cpu_copy) {
+      std::cerr << "[vk_update_guard] site=add_tensor_.copy action=cpu_roundtrip\n";
+      Tensor out_cpu = out.cpu();
+      self.copy_(out_cpu);
+    } else {
+      self.copy_(out);
+    }
+    if (ordering_flush_update_id > 0) {
+      api::Context* const context = api::context();
+      std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+      context->submit_cmd_to_gpu(VK_NULL_HANDLE);
+      context->flush();
+      std::cerr << "[vk_update_ordering_probe] id=" << ordering_flush_update_id
+                << " site=add_tensor_.copy action=submit_flush\n";
+    }
     return self;
   }
   return binary_op_tensor_(

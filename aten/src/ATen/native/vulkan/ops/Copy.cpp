@@ -2,6 +2,9 @@
 #include <ATen/native/vulkan/ops/Copy.h>
 #include <ATen/native/vulkan/ops/Utils.h>
 #include <ATen/vulkan/Context.h>
+#include <atomic>
+#include <cstdlib>
+#include <iostream>
 
 namespace at {
 namespace native {
@@ -309,6 +312,12 @@ void pack_vulkan_to_cpu(vTensor& src, Tensor& dst) {
 //
 
 Tensor& copy_(Tensor& dst, const Tensor& src) {
+  static const bool copy_trace_enabled = []() {
+    const char* value = std::getenv("PYTORCH_VULKAN_COPY_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  static std::atomic<int64_t> copy_trace_seq{0};
+
   // Check that sizes are equal
   TORCH_CHECK(
       dst.sizes() == src.sizes(), "Vulkan copy_: Tensor sizes are mismatched!");
@@ -324,6 +333,15 @@ Tensor& copy_(Tensor& dst, const Tensor& src) {
         v_src.storage_type() == api::StorageType::BUFFER;
     const bool dst_buffer =
         v_self.storage_type() == api::StorageType::BUFFER;
+    if (copy_trace_enabled) {
+      const int64_t trace_id = ++copy_trace_seq;
+      std::cerr << "[vk_copy_trace] id=" << trace_id
+                << " site=copy_.vv src_storage=" << static_cast<int>(v_src.storage_type())
+                << " dst_storage=" << static_cast<int>(v_self.storage_type())
+                << " src_dtype=" << static_cast<int>(v_src.dtype())
+                << " dst_dtype=" << static_cast<int>(v_self.dtype())
+                << " numel=" << src.numel() << "\n";
+    }
 
     if (src_buffer || dst_buffer) {
       if (v_src.dtype() != v_self.dtype()) {
