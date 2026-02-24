@@ -11,7 +11,9 @@
 #include <ATen/ops/floor_divide.h>
 #endif
 #include <atomic>
+#include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <iostream>
 #include <mutex>
 #include <torch/library.h>
@@ -205,6 +207,60 @@ inline bool should_run_ordering_probe_flush_for_update_id(
     return false;
   }
   return guard_end <= 0 || update_id <= guard_end;
+}
+
+enum class UpdateOrderingProbeMode final {
+  SubmitAndFlush,
+  SubmitOnly,
+  SubmitAndWaitIdle,
+  SubmitAndWaitIdleCleanup,
+};
+
+inline UpdateOrderingProbeMode update_ordering_probe_mode() {
+  static const UpdateOrderingProbeMode mode = []() {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_UPDATE_ORDERING_PROBE_MODE");
+    if (value == nullptr || value[0] == '\0') {
+      return UpdateOrderingProbeMode::SubmitAndFlush;
+    }
+    if (std::strcmp(value, "submit_and_flush") == 0) {
+      return UpdateOrderingProbeMode::SubmitAndFlush;
+    }
+    if (std::strcmp(value, "submit_only") == 0) {
+      return UpdateOrderingProbeMode::SubmitOnly;
+    }
+    if (std::strcmp(value, "submit_and_wait_idle") == 0) {
+      return UpdateOrderingProbeMode::SubmitAndWaitIdle;
+    }
+    if (std::strcmp(value, "submit_and_wait_idle_cleanup") == 0) {
+      return UpdateOrderingProbeMode::SubmitAndWaitIdleCleanup;
+    }
+    return UpdateOrderingProbeMode::SubmitAndFlush;
+  }();
+  return mode;
+}
+
+inline uint32_t update_ordering_probe_cleanup_mask() {
+  static const uint32_t mask = []() {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_UPDATE_ORDERING_PROBE_CLEANUP_MASK");
+    if (value == nullptr || value[0] == '\0') {
+      return api::Context::kFlushCleanupAll;
+    }
+
+    char* parse_end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &parse_end, 10);
+    if (parse_end == value || *parse_end != '\0' ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+      return api::Context::kFlushCleanupAll;
+    }
+
+    const uint32_t requested_mask = static_cast<uint32_t>(parsed);
+    const uint32_t active_mask =
+        requested_mask & api::Context::kFlushCleanupAll;
+    return (active_mask == 0u) ? api::Context::kFlushCleanupAll : active_mask;
+  }();
+  return mask;
 }
 
 thread_local bool g_update_guard_armed_for_add_tensor = false;
@@ -930,10 +986,28 @@ static Tensor& add_tensor_(
     if (ordering_flush_update_id > 0) {
       api::Context* const context = api::context();
       std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+      const UpdateOrderingProbeMode probe_mode = update_ordering_probe_mode();
       context->submit_cmd_to_gpu(VK_NULL_HANDLE);
-      context->flush();
-      std::cerr << "[vk_update_ordering_probe] id=" << ordering_flush_update_id
-                << " site=add_tensor_.copy action=submit_flush\n";
+      if (probe_mode == UpdateOrderingProbeMode::SubmitOnly) {
+        std::cerr << "[vk_update_ordering_probe] id=" << ordering_flush_update_id
+                  << " site=add_tensor_.copy action=submit_only\n";
+      } else if (probe_mode == UpdateOrderingProbeMode::SubmitAndWaitIdle) {
+        VK_CHECK(vkQueueWaitIdle(context->queue()));
+        std::cerr << "[vk_update_ordering_probe] id=" << ordering_flush_update_id
+                  << " site=add_tensor_.copy action=submit_wait_idle\n";
+      } else if (
+          probe_mode == UpdateOrderingProbeMode::SubmitAndWaitIdleCleanup) {
+        VK_CHECK(vkQueueWaitIdle(context->queue()));
+        const uint32_t cleanup_mask = update_ordering_probe_cleanup_mask();
+        context->flush_submit_cleanup(cleanup_mask);
+        std::cerr << "[vk_update_ordering_probe] id=" << ordering_flush_update_id
+                  << " site=add_tensor_.copy action=submit_wait_idle_cleanup"
+                  << " cleanup_mask=" << cleanup_mask << "\n";
+      } else {
+        context->flush();
+        std::cerr << "[vk_update_ordering_probe] id=" << ordering_flush_update_id
+                  << " site=add_tensor_.copy action=submit_flush\n";
+      }
     }
     return self;
   }

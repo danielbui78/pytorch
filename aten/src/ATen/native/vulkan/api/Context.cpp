@@ -105,21 +105,32 @@ void Context::submit_cmd_to_gpu(VkFence fence_handle, const bool final_use) {
   }
 }
 
-void Context::flush() {
-  VK_CHECK(vkQueueWaitIdle(queue()));
+void Context::flush_submit_cleanup(const uint32_t cleanup_mask) {
+  const uint32_t active_mask = cleanup_mask & kFlushCleanupAll;
 
-  command_pool_.flush();
-  descriptor_pool_.flush();
+  if (active_mask & kFlushCleanupCommandPool) {
+    command_pool_.flush();
+  }
+  if (active_mask & kFlushCleanupDescriptorPool) {
+    descriptor_pool_.flush();
+  }
 
-  // If there is an existing command buffer, invalidate it
-  if (cmd_) {
+  // If there is an existing command buffer, invalidate it.
+  if ((active_mask & kFlushCleanupInvalidateCmd) && cmd_) {
     cmd_.invalidate();
   }
 
-  std::lock_guard<std::mutex> bufferlist_lock(buffer_clearlist_mutex_);
-  std::lock_guard<std::mutex> imagelist_lock(image_clearlist_mutex_);
-  buffers_to_clear_.clear();
-  images_to_clear_.clear();
+  if (active_mask & kFlushCleanupDeferredClear) {
+    std::lock_guard<std::mutex> bufferlist_lock(buffer_clearlist_mutex_);
+    std::lock_guard<std::mutex> imagelist_lock(image_clearlist_mutex_);
+    buffers_to_clear_.clear();
+    images_to_clear_.clear();
+  }
+}
+
+void Context::flush() {
+  VK_CHECK(vkQueueWaitIdle(queue()));
+  flush_submit_cleanup();
 }
 
 bool available() {

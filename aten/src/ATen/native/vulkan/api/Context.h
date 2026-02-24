@@ -222,6 +222,16 @@ class Context final {
       VkFence fence_handle = VK_NULL_HANDLE,
       const bool final_use = false);
 
+  static constexpr uint32_t kFlushCleanupCommandPool = 1u << 0;
+  static constexpr uint32_t kFlushCleanupDescriptorPool = 1u << 1;
+  static constexpr uint32_t kFlushCleanupInvalidateCmd = 1u << 2;
+  static constexpr uint32_t kFlushCleanupDeferredClear = 1u << 3;
+  static constexpr uint32_t kFlushCleanupAll = kFlushCleanupCommandPool |
+      kFlushCleanupDescriptorPool | kFlushCleanupInvalidateCmd |
+      kFlushCleanupDeferredClear;
+
+  void flush_submit_cleanup(uint32_t cleanup_mask = kFlushCleanupAll);
+
   void flush();
 };
 
