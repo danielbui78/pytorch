@@ -263,9 +263,126 @@ inline uint32_t update_ordering_probe_cleanup_mask() {
   return mask;
 }
 
+enum class UpdateDescriptorFixMode final {
+  Disabled,
+  SubmitAndWaitIdleCleanup,
+  SubmitAndWaitIdleCleanupPeriodic,
+};
+
+inline UpdateDescriptorFixMode update_descriptor_fix_mode() {
+  static const UpdateDescriptorFixMode mode = []() {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_UPDATE_DESCRIPTOR_FIX_MODE");
+    if (value == nullptr || value[0] == '\0') {
+      return UpdateDescriptorFixMode::Disabled;
+    }
+    if (std::strcmp(value, "submit_and_wait_idle_cleanup") == 0 ||
+        std::strcmp(value, "1") == 0) {
+      return UpdateDescriptorFixMode::SubmitAndWaitIdleCleanup;
+    }
+    if (std::strcmp(value, "submit_and_wait_idle_cleanup_periodic") == 0 ||
+        std::strcmp(value, "periodic") == 0) {
+      return UpdateDescriptorFixMode::SubmitAndWaitIdleCleanupPeriodic;
+    }
+    return UpdateDescriptorFixMode::Disabled;
+  }();
+  return mode;
+}
+
+inline int64_t update_descriptor_fix_at() {
+  static const int64_t guard_at = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_DESCRIPTOR_FIX_AT",
+      -1);
+  return guard_at;
+}
+
+inline int64_t update_descriptor_fix_start() {
+  static const int64_t guard_start = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_DESCRIPTOR_FIX_START",
+      -1);
+  return guard_start;
+}
+
+inline int64_t update_descriptor_fix_end() {
+  static const int64_t guard_end = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_DESCRIPTOR_FIX_END",
+      -1);
+  return guard_end;
+}
+
+inline int64_t update_descriptor_fix_period() {
+  static const int64_t period = parse_positive_int_env(
+      "PYTORCH_VULKAN_UPDATE_DESCRIPTOR_FIX_PERIOD",
+      -1);
+  return period;
+}
+
+inline int64_t update_descriptor_fix_offset() {
+  static const int64_t offset = []() -> int64_t {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_UPDATE_DESCRIPTOR_FIX_OFFSET");
+    if (value == nullptr || value[0] == '\0') {
+      return 0;
+    }
+    char* parse_end = nullptr;
+    const long parsed = std::strtol(value, &parse_end, 10);
+    if (parse_end == value || *parse_end != '\0') {
+      return 0;
+    }
+    return static_cast<int64_t>(parsed);
+  }();
+  return offset;
+}
+
+inline bool should_run_update_descriptor_fix_periodic_for_update_id(
+    const int64_t update_id) {
+  const int64_t period = update_descriptor_fix_period();
+  if (period <= 0) {
+    return false;
+  }
+
+  const int64_t offset = update_descriptor_fix_offset();
+  if (offset < 0 || offset >= period) {
+    return false;
+  }
+
+  return (update_id % period) == offset;
+}
+
+inline bool should_run_update_descriptor_fix_for_update_id(
+    const int64_t update_id) {
+  const UpdateDescriptorFixMode mode = update_descriptor_fix_mode();
+  if (mode == UpdateDescriptorFixMode::Disabled) {
+    return false;
+  }
+  if (mode == UpdateDescriptorFixMode::SubmitAndWaitIdleCleanupPeriodic) {
+    return should_run_update_descriptor_fix_periodic_for_update_id(update_id);
+  }
+
+  const int64_t guard_at = update_descriptor_fix_at();
+  if (guard_at > 0) {
+    return update_id == guard_at;
+  }
+
+  const int64_t guard_start = update_descriptor_fix_start();
+  if (guard_start > 0) {
+    if (update_id < guard_start) {
+      return false;
+    }
+    const int64_t guard_end = update_descriptor_fix_end();
+    if (guard_end > 0 && guard_end < guard_start) {
+      return false;
+    }
+    return guard_end <= 0 || update_id <= guard_end;
+  }
+
+  return true;
+}
+
 thread_local bool g_update_guard_armed_for_add_tensor = false;
 thread_local bool g_update_guard_force_cpu_copy_next = false;
 thread_local int64_t g_update_ordering_probe_flush_update_id = -1;
+thread_local int64_t g_update_descriptor_fix_update_id = -1;
 
 struct UpdateGuardArm final {
   UpdateGuardArm() {
@@ -294,6 +411,16 @@ inline void arm_update_ordering_probe_flush_after_copy(
 inline int64_t consume_update_ordering_probe_flush_after_copy() {
   const int64_t update_id = g_update_ordering_probe_flush_update_id;
   g_update_ordering_probe_flush_update_id = -1;
+  return update_id;
+}
+
+inline void arm_update_descriptor_fix_after_copy(const int64_t update_id) {
+  g_update_descriptor_fix_update_id = update_id;
+}
+
+inline int64_t consume_update_descriptor_fix_after_copy() {
+  const int64_t update_id = g_update_descriptor_fix_update_id;
+  g_update_descriptor_fix_update_id = -1;
   return update_id;
 }
 
@@ -915,6 +1042,8 @@ static Tensor add_tensor(
         should_force_cpu_copy_for_update_id(update_id);
     const bool ordering_probe_hit = g_update_guard_armed_for_add_tensor &&
         should_run_ordering_probe_flush_for_update_id(update_id);
+    const bool descriptor_fix_hit = g_update_guard_armed_for_add_tensor &&
+        should_run_update_descriptor_fix_for_update_id(update_id);
     if (cpu_guard_hit) {
       arm_update_guard_force_cpu_copy_next();
       std::cerr << "[vk_update_guard] id=" << update_id
@@ -925,15 +1054,22 @@ static Tensor add_tensor(
       std::cerr << "[vk_update_ordering_probe] id=" << update_id
                 << " site=add_tensor action=arm_flush_after_copy\n";
     }
+    if (descriptor_fix_hit) {
+      arm_update_descriptor_fix_after_copy(update_id);
+      std::cerr << "[vk_update_fix_candidate] id=" << update_id
+                << " site=add_tensor action=arm_descriptor_cleanup_after_copy\n";
+    }
     if (update_trace_enabled()) {
-      const bool guard_hit = cpu_guard_hit || ordering_probe_hit;
+      const bool guard_hit =
+          cpu_guard_hit || ordering_probe_hit || descriptor_fix_hit;
       std::cerr << "[vk_update_trace] id=" << update_id
                 << " site=add_tensor alpha=" << alpha.to<float>()
                 << " self_numel=" << self_arg.numel()
                 << " other_numel=" << other_arg.numel()
                 << " guard_hit=" << guard_hit
                 << " guard_cpu_hit=" << cpu_guard_hit
-                << " guard_flush_hit=" << ordering_probe_hit << "\n";
+                << " guard_flush_hit=" << ordering_probe_hit
+                << " guard_fix_hit=" << descriptor_fix_hit << "\n";
     }
   }
   return binary_op_tensor(
@@ -968,6 +1104,8 @@ static Tensor& add_tensor_(
     const bool force_cpu_copy = consume_update_guard_force_cpu_copy_next();
     const int64_t ordering_flush_update_id =
         consume_update_ordering_probe_flush_after_copy();
+    const int64_t descriptor_fix_update_id =
+        consume_update_descriptor_fix_after_copy();
     if (trace_id > 0 && trace_id <= binaryop_trace_limit()) {
       const vTensor& v_out = convert(out);
       std::cerr << "[vk_binaryop_trace] id=" << trace_id
@@ -1007,6 +1145,27 @@ static Tensor& add_tensor_(
         context->flush();
         std::cerr << "[vk_update_ordering_probe] id=" << ordering_flush_update_id
                   << " site=add_tensor_.copy action=submit_flush\n";
+      }
+    }
+    if (descriptor_fix_update_id > 0) {
+      api::Context* const context = api::context();
+      std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+      context->submit_cmd_to_gpu(VK_NULL_HANDLE);
+      const UpdateDescriptorFixMode descriptor_fix_mode =
+          update_descriptor_fix_mode();
+      if (
+          descriptor_fix_mode ==
+              UpdateDescriptorFixMode::SubmitAndWaitIdleCleanup ||
+          descriptor_fix_mode ==
+              UpdateDescriptorFixMode::SubmitAndWaitIdleCleanupPeriodic) {
+        VK_CHECK(vkQueueWaitIdle(context->queue()));
+        constexpr uint32_t cleanup_mask =
+            api::Context::kFlushCleanupDescriptorPool;
+        context->flush_submit_cleanup(cleanup_mask);
+        std::cerr << "[vk_update_fix_candidate] id=" << descriptor_fix_update_id
+                  << " site=add_tensor_.copy"
+                  << " action=submit_wait_idle_cleanup"
+                  << " cleanup_mask=" << cleanup_mask << "\n";
       }
     }
     return self;

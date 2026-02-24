@@ -2,12 +2,84 @@
 #include <ATen/native/vulkan/api/Utils.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
 #include <utility>
 
 namespace at {
 namespace native {
 namespace vulkan {
 namespace api {
+
+namespace {
+
+constexpr uint32_t kDescriptorFlushResetBit = 1u << 0;
+constexpr uint32_t kDescriptorFlushClearPilesBit = 1u << 1;
+constexpr uint32_t kDescriptorFlushAllBits =
+    kDescriptorFlushResetBit | kDescriptorFlushClearPilesBit;
+
+inline bool descriptor_flush_probe_mask_overridden() {
+  static const bool overridden = []() {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_UPDATE_ORDERING_PROBE_DESCRIPTOR_FLUSH_MASK");
+    return value != nullptr && value[0] != '\0';
+  }();
+  return overridden;
+}
+
+inline uint32_t descriptor_flush_probe_mask() {
+  static const uint32_t mask = []() {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_UPDATE_ORDERING_PROBE_DESCRIPTOR_FLUSH_MASK");
+    if (value == nullptr || value[0] == '\0') {
+      return kDescriptorFlushAllBits;
+    }
+
+    char* parse_end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &parse_end, 10);
+    if (parse_end == value || *parse_end != '\0' ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+      return kDescriptorFlushAllBits;
+    }
+
+    const uint32_t requested_mask = static_cast<uint32_t>(parsed);
+    const uint32_t active_mask = requested_mask & kDescriptorFlushAllBits;
+    return (active_mask == 0u) ? kDescriptorFlushAllBits : active_mask;
+  }();
+  return mask;
+}
+
+inline bool descriptor_pool_telemetry_enabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("PYTORCH_VULKAN_DESCRIPTOR_POOL_TELEMETRY");
+    if (value == nullptr || value[0] == '\0') {
+      return false;
+    }
+    return !(value[0] == '0' || value[0] == 'f' || value[0] == 'F' ||
+             value[0] == 'n' || value[0] == 'N');
+  }();
+  return enabled;
+}
+
+inline uint64_t descriptor_pool_telemetry_every() {
+  static const uint64_t every = []() {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_DESCRIPTOR_POOL_TELEMETRY_EVERY");
+    if (value == nullptr || value[0] == '\0') {
+      return static_cast<uint64_t>(128ull);
+    }
+    char* parse_end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &parse_end, 10);
+    if (parse_end == value || *parse_end != '\0' || parsed == 0ull) {
+      return static_cast<uint64_t>(128ull);
+    }
+    return static_cast<uint64_t>(parsed);
+  }();
+  return every;
+}
+
+} // namespace
 
 //
 // DescriptorSet
@@ -201,7 +273,13 @@ DescriptorPool::DescriptorPool(
       pool_(VK_NULL_HANDLE),
       config_(config),
       mutex_{},
-      piles_{} {
+      piles_{},
+      telemetry_get_requests_(0u),
+      telemetry_pile_hits_(0u),
+      telemetry_pile_misses_(0u),
+      telemetry_flush_calls_(0u),
+      telemetry_reset_calls_(0u),
+      telemetry_clear_calls_(0u) {
   if (config.descriptorPoolMaxSets > 0) {
     init(config);
   }
@@ -258,8 +336,10 @@ DescriptorSet DescriptorPool::get_descriptor_set(
   VK_CHECK_COND(
       pool_ != VK_NULL_HANDLE, "DescriptorPool has not yet been initialized!");
 
+  bool pile_hit = true;
   auto it = piles_.find(set_layout);
   if (piles_.cend() == it) {
+    pile_hit = false;
     it = piles_
              .insert({
                  set_layout,
@@ -269,6 +349,27 @@ DescriptorSet DescriptorPool::get_descriptor_set(
              .first;
   }
 
+  ++telemetry_get_requests_;
+  if (pile_hit) {
+    ++telemetry_pile_hits_;
+  } else {
+    ++telemetry_pile_misses_;
+  }
+  if (descriptor_pool_telemetry_enabled()) {
+    const uint64_t emit_every = descriptor_pool_telemetry_every();
+    if (!pile_hit || (telemetry_get_requests_ % emit_every) == 0u) {
+      std::cerr << "[vk_descriptor_pool_telemetry] site=get"
+                << " seq=" << telemetry_get_requests_
+                << " pile_hit=" << static_cast<int>(pile_hit)
+                << " piles_size=" << piles_.size()
+                << " pile_hits=" << telemetry_pile_hits_
+                << " pile_misses=" << telemetry_pile_misses_
+                << " flush_calls=" << telemetry_flush_calls_
+                << " reset_calls=" << telemetry_reset_calls_
+                << " clear_calls=" << telemetry_clear_calls_ << "\n";
+    }
+  }
+
   VkDescriptorSet handle = it->second.get_descriptor_set();
 
   return DescriptorSet(device_, handle, signature);
@@ -276,8 +377,42 @@ DescriptorSet DescriptorPool::get_descriptor_set(
 
 void DescriptorPool::flush() {
   if (pool_ != VK_NULL_HANDLE) {
-    VK_CHECK(vkResetDescriptorPool(device_, pool_, 0u));
-    piles_.clear();
+    ++telemetry_flush_calls_;
+    const uint32_t active_mask = descriptor_flush_probe_mask();
+    if (descriptor_pool_telemetry_enabled()) {
+      std::cerr << "[vk_descriptor_pool_telemetry] site=flush.begin"
+                << " flush_call=" << telemetry_flush_calls_
+                << " active_mask=" << active_mask
+                << " piles_before=" << piles_.size()
+                << " gets=" << telemetry_get_requests_
+                << " pile_hits=" << telemetry_pile_hits_
+                << " pile_misses=" << telemetry_pile_misses_
+                << " reset_calls=" << telemetry_reset_calls_
+                << " clear_calls=" << telemetry_clear_calls_ << "\n";
+    }
+    if (descriptor_flush_probe_mask_overridden()) {
+      std::cerr << "[vk_update_ordering_probe] site=descriptor_pool.flush"
+                << " descriptor_flush_mask=" << active_mask << "\n";
+    }
+    if (active_mask & kDescriptorFlushResetBit) {
+      VK_CHECK(vkResetDescriptorPool(device_, pool_, 0u));
+      ++telemetry_reset_calls_;
+    }
+    if (active_mask & kDescriptorFlushClearPilesBit) {
+      piles_.clear();
+      ++telemetry_clear_calls_;
+    }
+    if (descriptor_pool_telemetry_enabled()) {
+      std::cerr << "[vk_descriptor_pool_telemetry] site=flush.end"
+                << " flush_call=" << telemetry_flush_calls_
+                << " active_mask=" << active_mask
+                << " piles_after=" << piles_.size()
+                << " gets=" << telemetry_get_requests_
+                << " pile_hits=" << telemetry_pile_hits_
+                << " pile_misses=" << telemetry_pile_misses_
+                << " reset_calls=" << telemetry_reset_calls_
+                << " clear_calls=" << telemetry_clear_calls_ << "\n";
+    }
   }
 }
 

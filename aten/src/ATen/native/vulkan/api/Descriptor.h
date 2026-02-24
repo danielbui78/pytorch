@@ -9,6 +9,7 @@
 #include <ATen/native/vulkan/api/Resource.h>
 #include <ATen/native/vulkan/api/Shader.h>
 
+#include <cstdint>
 #include <unordered_map>
 
 namespace at {
@@ -117,6 +118,13 @@ class DescriptorPool final {
   // New Descriptors
   std::mutex mutex_;
   std::unordered_map<VkDescriptorSetLayout, DescriptorSetPile> piles_;
+  // Probe-only lifecycle telemetry counters.
+  uint64_t telemetry_get_requests_;
+  uint64_t telemetry_pile_hits_;
+  uint64_t telemetry_pile_misses_;
+  uint64_t telemetry_flush_calls_;
+  uint64_t telemetry_reset_calls_;
+  uint64_t telemetry_clear_calls_;
 
  public:
   operator bool() const {
