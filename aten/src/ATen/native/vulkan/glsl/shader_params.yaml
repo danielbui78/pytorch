@@ -150,3 +150,23 @@ mean_dim_buffer_f16:
   parameter_names_with_default_values: {}
   shader_variants:
     - NAME: mean_dim_buffer_f16
+
+sum_dim_buffer_pass1:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: sum_dim_buffer_pass1
+
+sum_dim_buffer_pass2:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: sum_dim_buffer_pass2
+
+mean_dim_buffer_pass1:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: mean_dim_buffer_pass1
+
+mean_dim_buffer_pass2:
+  parameter_names_with_default_values: {}
+  shader_variants:
+    - NAME: mean_dim_buffer_pass2
