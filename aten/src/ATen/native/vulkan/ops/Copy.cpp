@@ -343,21 +343,21 @@ Tensor& copy_(Tensor& dst, const Tensor& src) {
                 << " numel=" << src.numel() << "\n";
     }
 
-    if (src_buffer || dst_buffer) {
-      if (v_src.dtype() != v_self.dtype()) {
+    if (v_src.dtype() != v_self.dtype()) {
+      // Vulkan texture-to-texture copy is a raw image transfer. Route dtype
+      // conversion through CPU staging to preserve numeric values.
+      Tensor src_cpu = src.cpu();
+      pack_cpu_to_vulkan(src_cpu, v_self);
+    } else if (src_buffer || dst_buffer) {
+      const bool mixed_storage = src_buffer != dst_buffer;
+      if (mixed_storage && v_src.dtype() != api::kFloat) {
         Tensor src_cpu = src.cpu();
         pack_cpu_to_vulkan(src_cpu, v_self);
       } else {
-        const bool mixed_storage = src_buffer != dst_buffer;
-        if (mixed_storage && v_src.dtype() != api::kFloat) {
-          Tensor src_cpu = src.cpu();
-          pack_cpu_to_vulkan(src_cpu, v_self);
-        } else {
-          const api::ScalarType staging_dtype =
-              staging_dtype_for_copy(api::context(), v_src, v_self);
-          transfer_vulkan_to_vulkan_staging(
-              v_src, v_self, staging_dtype);
-        }
+        const api::ScalarType staging_dtype =
+            staging_dtype_for_copy(api::context(), v_src, v_self);
+        transfer_vulkan_to_vulkan_staging(
+            v_src, v_self, staging_dtype);
       }
     } else {
       transfer_vulkan_to_vulkan(v_src, v_self);

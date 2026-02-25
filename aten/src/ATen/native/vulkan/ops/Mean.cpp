@@ -171,6 +171,14 @@ Tensor mean_dim(
   const bool use_buffer_path =
       v_input.storage_type() == api::StorageType::BUFFER &&
       buffer_reduction_dtype_supported(output_dtype);
+  if (use_buffer_path && output_dtype == api::kHalf) {
+    // Temporary fp16 guard: large buffer reductions can produce invalid fp16
+    // outputs; reduce in float and cast back.
+    const Tensor input_float = input.to(at::kFloat);
+    Tensor reduced_float =
+        mean_dim(input_float, buffer_dim, keepdim, c10::ScalarType::Float);
+    return reduced_float.to(c10::ScalarType::Half);
+  }
   if (use_buffer_path) {
     const uint32_t axis =
         safe_downcast<uint32_t>((self.dim() - 1) - buffer_dim);
