@@ -1,6 +1,8 @@
 #include <ATen/native/vulkan/ops/Common.h>
 #include <ATen/native/vulkan/ops/Utils.h>
 #include <torch/library.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace at {
 namespace native {
@@ -13,6 +15,52 @@ using namespace api::utils;
 inline bool buffer_reduction_dtype_supported(const api::ScalarType dtype) {
   return dtype == api::kFloat ||
       (dtype == api::kHalf && api::context()->fp16_buffer_storage_enabled());
+}
+
+enum class BufferReductionRoute {
+  Auto = 0,
+  ForceSinglePass = 1,
+  ForceGuardedFp32 = 2,
+};
+
+inline BufferReductionRoute parse_buffer_reduction_route(const char* value) {
+  if (value == nullptr || value[0] == '\0') {
+    return BufferReductionRoute::Auto;
+  }
+  if (
+      std::strcmp(value, "single_pass") == 0 ||
+      std::strcmp(value, "force_single_pass") == 0) {
+    return BufferReductionRoute::ForceSinglePass;
+  }
+  if (
+      std::strcmp(value, "guarded_fp32") == 0 ||
+      std::strcmp(value, "force_guarded_fp32") == 0) {
+    return BufferReductionRoute::ForceGuardedFp32;
+  }
+  return BufferReductionRoute::Auto;
+}
+
+inline BufferReductionRoute buffer_reduction_route() {
+  static const BufferReductionRoute route = parse_buffer_reduction_route(
+      std::getenv("PYTORCH_VULKAN_BUFFER_REDUCTION_ROUTE"));
+  return route;
+}
+
+inline bool should_use_fp16_guard(
+    const bool use_buffer_path,
+    const api::ScalarType output_dtype) {
+  if (!use_buffer_path || output_dtype != api::kHalf) {
+    return false;
+  }
+  switch (buffer_reduction_route()) {
+    case BufferReductionRoute::ForceSinglePass:
+      return false;
+    case BufferReductionRoute::Auto:
+    case BufferReductionRoute::ForceGuardedFp32:
+      return true;
+    default:
+      return true;
+  }
 }
 
 inline void check_storage_buffer_limit(
@@ -171,7 +219,7 @@ Tensor mean_dim(
   const bool use_buffer_path =
       v_input.storage_type() == api::StorageType::BUFFER &&
       buffer_reduction_dtype_supported(output_dtype);
-  if (use_buffer_path && output_dtype == api::kHalf) {
+  if (should_use_fp16_guard(use_buffer_path, output_dtype)) {
     // Temporary fp16 guard: large buffer reductions can produce invalid fp16
     // outputs; reduce in float and cast back.
     const Tensor input_float = input.to(at::kFloat);
