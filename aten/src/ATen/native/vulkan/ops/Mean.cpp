@@ -3,6 +3,7 @@
 #include <torch/library.h>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 
 namespace at {
 namespace native {
@@ -23,6 +24,8 @@ enum class BufferReductionRoute {
   ForceGuardedFp32 = 2,
   ForceTwoPass = 3,
 };
+
+constexpr uint32_t kTwoPassAutoMinDim = 200000u;
 
 inline BufferReductionRoute parse_buffer_reduction_route(const char* value) {
   if (value == nullptr || value[0] == '\0') {
@@ -52,6 +55,65 @@ inline BufferReductionRoute buffer_reduction_route() {
   return route;
 }
 
+inline const char* buffer_reduction_route_name(const BufferReductionRoute route) {
+  switch (route) {
+    case BufferReductionRoute::Auto:
+      return "auto";
+    case BufferReductionRoute::ForceSinglePass:
+      return "single_pass";
+    case BufferReductionRoute::ForceGuardedFp32:
+      return "guarded_fp32";
+    case BufferReductionRoute::ForceTwoPass:
+      return "two_pass";
+    default:
+      return "unknown";
+  }
+}
+
+inline bool buffer_reduction_debug_enabled() {
+  static const bool enabled = []() {
+    const char* value =
+        std::getenv("PYTORCH_VULKAN_BUFFER_REDUCTION_DEBUG_ROUTE");
+    if (value == nullptr || value[0] == '\0') {
+      return false;
+    }
+    return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "on") == 0;
+  }();
+  return enabled;
+}
+
+inline void log_buffer_reduction_route_decision(
+    const char* op_name,
+    const BufferReductionRoute force_mode,
+    const bool use_buffer_path,
+    const api::ScalarType output_dtype,
+    const uint32_t dim_size,
+    const bool use_fp16_guard,
+    const bool use_two_pass,
+    const uint32_t threshold) {
+  if (!buffer_reduction_debug_enabled()) {
+    return;
+  }
+  const char* selected_route = "image";
+  if (use_fp16_guard) {
+    selected_route = "guarded_fp32";
+  } else if (use_buffer_path) {
+    selected_route = use_two_pass ? "two_pass" : "single_pass";
+  }
+  std::fprintf(
+      stderr,
+      "[vulkan_buffer_reduction][%s] force=%s use_buffer=%d dtype=%d dim_size=%u threshold=%u selected=%s\n",
+      op_name,
+      buffer_reduction_route_name(force_mode),
+      use_buffer_path ? 1 : 0,
+      static_cast<int>(output_dtype),
+      dim_size,
+      threshold,
+      selected_route);
+  std::fflush(stderr);
+}
+
 inline bool should_use_fp16_guard(
     const bool use_buffer_path,
     const api::ScalarType output_dtype) {
@@ -76,7 +138,16 @@ inline bool should_use_two_pass(
   if (!use_buffer_path || output_dtype != api::kFloat || dim_size <= 1u) {
     return false;
   }
-  return buffer_reduction_route() == BufferReductionRoute::ForceTwoPass;
+  switch (buffer_reduction_route()) {
+    case BufferReductionRoute::ForceSinglePass:
+      return false;
+    case BufferReductionRoute::ForceTwoPass:
+      return true;
+    case BufferReductionRoute::Auto:
+      return dim_size >= kTwoPassAutoMinDim;
+    default:
+      return false;
+  }
 }
 
 inline void check_storage_buffer_limit(
@@ -329,7 +400,20 @@ Tensor mean_dim(
   const bool use_buffer_path =
       v_input.storage_type() == api::StorageType::BUFFER &&
       buffer_reduction_dtype_supported(output_dtype);
-  if (should_use_fp16_guard(use_buffer_path, output_dtype)) {
+    const BufferReductionRoute force_mode = buffer_reduction_route();
+    const bool use_fp16_guard = should_use_fp16_guard(use_buffer_path, output_dtype);
+    const bool use_two_pass =
+      should_use_two_pass(use_buffer_path, output_dtype, dim_size);
+    log_buffer_reduction_route_decision(
+      "mean",
+      force_mode,
+      use_buffer_path,
+      output_dtype,
+      dim_size,
+      use_fp16_guard,
+      use_two_pass,
+      kTwoPassAutoMinDim);
+    if (use_fp16_guard) {
     // Temporary fp16 guard: large buffer reductions can produce invalid fp16
     // outputs; reduce in float and cast back.
     const Tensor input_float = input.to(at::kFloat);
@@ -337,7 +421,7 @@ Tensor mean_dim(
         mean_dim(input_float, buffer_dim, keepdim, c10::ScalarType::Float);
     return reduced_float.to(c10::ScalarType::Half);
   }
-  if (should_use_two_pass(use_buffer_path, output_dtype, dim_size)) {
+    if (use_two_pass) {
     const uint32_t axis =
         safe_downcast<uint32_t>((self.dim() - 1) - buffer_dim);
     return run_mean_buffer_reduction_two_pass(
