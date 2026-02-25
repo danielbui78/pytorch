@@ -427,10 +427,18 @@ Tensor select(const Tensor& self, int64_t dim, int64_t index) {
   }
 }
 
+Tensor index_select(const Tensor& self, int64_t dim, const Tensor& index) {
+  const Tensor self_vk = self.is_vulkan() ? self : self.vulkan();
+  const Tensor index_cpu = index.device().is_cpu() ? index : index.cpu();
+  const Tensor output_cpu = self_vk.cpu().index_select(dim, index_cpu);
+  return output_cpu.vulkan();
+}
+
 #ifdef USE_VULKAN_API
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(TORCH_SELECTIVE_NAME("aten::select.int"), TORCH_FN(select));
+  m.impl(TORCH_SELECTIVE_NAME("aten::index_select"), TORCH_FN(index_select));
 }
 
 #endif /* USE_VULKAN_API */
