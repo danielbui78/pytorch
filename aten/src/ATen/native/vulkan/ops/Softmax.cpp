@@ -5,6 +5,7 @@
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #else
+#include <ATen/ops/_log_softmax_backward_data.h>
 #include <ATen/ops/_softmax_backward_data.h>
 #endif
 
@@ -244,11 +245,55 @@ Tensor& softmax_backward_data_out(
   return grad_input;
 }
 
+Tensor log_softmax_backward_data(
+    const Tensor& grad_output_arg,
+    const Tensor& output_arg,
+    const int64_t dim,
+    const ScalarType input_dtype) {
+  const Tensor grad_output_cpu =
+      grad_output_arg.is_vulkan() ? grad_output_arg.cpu() : grad_output_arg;
+  const Tensor output_cpu =
+      output_arg.is_vulkan() ? output_arg.cpu() : output_arg;
+  Tensor grad_input_cpu = at::_log_softmax_backward_data(
+      grad_output_cpu,
+      output_cpu,
+      dim,
+      input_dtype);
+  return grad_input_cpu.to(at::kVulkan);
+}
+
+Tensor& log_softmax_backward_data_out(
+    const Tensor& grad_output_arg,
+    const Tensor& output_arg,
+    const int64_t dim,
+    const ScalarType input_dtype,
+    Tensor& grad_input) {
+  const Tensor grad_output_cpu =
+      grad_output_arg.is_vulkan() ? grad_output_arg.cpu() : grad_output_arg;
+  const Tensor output_cpu =
+      output_arg.is_vulkan() ? output_arg.cpu() : output_arg;
+  const Tensor grad_input_cpu = at::_log_softmax_backward_data(
+      grad_output_cpu,
+      output_cpu,
+      dim,
+      input_dtype);
+  if (grad_input.is_vulkan()) {
+    grad_input.copy_(grad_input_cpu.to(at::kVulkan));
+  } else {
+    grad_input.copy_(grad_input_cpu);
+  }
+  return grad_input;
+}
+
 #ifdef USE_VULKAN_API
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl("_softmax", TORCH_FN(softmax));
   m.impl("_log_softmax", TORCH_FN(log_softmax));
+  m.impl("_log_softmax_backward_data", TORCH_FN(log_softmax_backward_data));
+  m.impl(
+      "_log_softmax_backward_data.out",
+      TORCH_FN(log_softmax_backward_data_out));
   m.impl("_softmax_backward_data", TORCH_FN(softmax_backward_data));
   m.impl("_softmax_backward_data.out", TORCH_FN(softmax_backward_data_out));
 }

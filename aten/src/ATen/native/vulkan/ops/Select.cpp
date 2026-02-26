@@ -1,5 +1,6 @@
 #include <ATen/native/vulkan/ops/Common.h>
 #include <ATen/ops/embedding_dense_backward.h>
+#include <ATen/ops/nll_loss_backward.h>
 #include <ATen/ops/nll_loss_forward.h>
 #include <torch/library.h>
 
@@ -454,6 +455,15 @@ Tensor embedding_dense_backward(
   return grad_weight_cpu.vulkan();
 }
 
+std::optional<Tensor> optional_weight_to_cpu(const std::optional<Tensor>& weight) {
+  if (!weight.has_value() || !weight->defined()) {
+    return std::nullopt;
+  }
+  return weight->device().is_cpu()
+      ? std::optional<Tensor>(*weight)
+      : std::optional<Tensor>(weight->cpu());
+}
+
 std::tuple<Tensor, Tensor> nll_loss_forward(
     const Tensor& self,
     const Tensor& target,
@@ -462,11 +472,7 @@ std::tuple<Tensor, Tensor> nll_loss_forward(
     c10::SymInt ignore_index) {
   const Tensor self_cpu = self.device().is_cpu() ? self : self.cpu();
   const Tensor target_cpu = target.device().is_cpu() ? target : target.cpu();
-  const std::optional<Tensor> weight_cpu =
-      weight.has_value()
-      ? std::optional<Tensor>(
-            weight->device().is_cpu() ? *weight : weight->cpu())
-      : std::nullopt;
+  const std::optional<Tensor> weight_cpu = optional_weight_to_cpu(weight);
 
   auto [output_cpu, total_weight_cpu] = at::nll_loss_forward_symint(
       self_cpu,
@@ -497,6 +503,40 @@ std::tuple<Tensor&, Tensor&> nll_loss_forward_output(
   return std::tuple<Tensor&, Tensor&>{output, total_weight};
 }
 
+Tensor& nll_loss_backward_grad_input(
+    const Tensor& grad_output,
+    const Tensor& self,
+    const Tensor& target,
+    const std::optional<Tensor>& weight,
+    int64_t reduction,
+    c10::SymInt ignore_index,
+    const Tensor& total_weight,
+    Tensor& grad_input) {
+  const Tensor grad_output_cpu =
+      grad_output.device().is_cpu() ? grad_output : grad_output.cpu();
+  const Tensor self_cpu = self.device().is_cpu() ? self : self.cpu();
+  const Tensor target_cpu = target.device().is_cpu() ? target : target.cpu();
+  const std::optional<Tensor> weight_cpu = optional_weight_to_cpu(weight);
+  const Tensor total_weight_cpu =
+      total_weight.device().is_cpu() ? total_weight : total_weight.cpu();
+
+  const Tensor grad_input_cpu = at::nll_loss_backward_symint(
+      grad_output_cpu,
+      self_cpu,
+      target_cpu,
+      weight_cpu,
+      reduction,
+      ignore_index,
+      total_weight_cpu);
+
+  if (grad_input.device().is_cpu()) {
+    grad_input.copy_(grad_input_cpu);
+  } else {
+    grad_input.copy_(grad_input_cpu.vulkan());
+  }
+  return grad_input;
+}
+
 #ifdef USE_VULKAN_API
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
@@ -509,6 +549,9 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("aten::nll_loss_forward.output"),
       TORCH_FN(nll_loss_forward_output));
+    m.impl(
+      TORCH_SELECTIVE_NAME("aten::nll_loss_backward.grad_input"),
+      TORCH_FN(nll_loss_backward_grad_input));
 }
 
 #endif /* USE_VULKAN_API */
