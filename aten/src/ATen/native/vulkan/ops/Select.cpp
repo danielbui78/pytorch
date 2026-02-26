@@ -1,4 +1,5 @@
 #include <ATen/native/vulkan/ops/Common.h>
+#include <ATen/ops/embedding_dense_backward.h>
 #include <torch/library.h>
 
 namespace at {
@@ -434,11 +435,32 @@ Tensor index_select(const Tensor& self, int64_t dim, const Tensor& index) {
   return output_cpu.vulkan();
 }
 
+Tensor embedding_dense_backward(
+    const Tensor& grad_output,
+    const Tensor& indices,
+    int64_t num_weights,
+    int64_t padding_idx,
+    bool scale_grad_by_freq) {
+  const Tensor grad_output_cpu =
+      grad_output.device().is_cpu() ? grad_output : grad_output.cpu();
+  const Tensor indices_cpu = indices.device().is_cpu() ? indices : indices.cpu();
+  const Tensor grad_weight_cpu = at::embedding_dense_backward(
+      grad_output_cpu,
+      indices_cpu,
+      num_weights,
+      padding_idx,
+      scale_grad_by_freq);
+  return grad_weight_cpu.vulkan();
+}
+
 #ifdef USE_VULKAN_API
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(TORCH_SELECTIVE_NAME("aten::select.int"), TORCH_FN(select));
   m.impl(TORCH_SELECTIVE_NAME("aten::index_select"), TORCH_FN(index_select));
+  m.impl(
+      TORCH_SELECTIVE_NAME("aten::embedding_dense_backward"),
+      TORCH_FN(embedding_dense_backward));
 }
 
 #endif /* USE_VULKAN_API */
