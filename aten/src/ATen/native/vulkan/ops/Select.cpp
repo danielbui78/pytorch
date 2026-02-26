@@ -1,5 +1,6 @@
 #include <ATen/native/vulkan/ops/Common.h>
 #include <ATen/ops/embedding_dense_backward.h>
+#include <ATen/ops/nll_loss_forward.h>
 #include <torch/library.h>
 
 namespace at {
@@ -453,6 +454,49 @@ Tensor embedding_dense_backward(
   return grad_weight_cpu.vulkan();
 }
 
+std::tuple<Tensor, Tensor> nll_loss_forward(
+    const Tensor& self,
+    const Tensor& target,
+    const std::optional<Tensor>& weight,
+    int64_t reduction,
+    c10::SymInt ignore_index) {
+  const Tensor self_cpu = self.device().is_cpu() ? self : self.cpu();
+  const Tensor target_cpu = target.device().is_cpu() ? target : target.cpu();
+  const std::optional<Tensor> weight_cpu =
+      weight.has_value()
+      ? std::optional<Tensor>(
+            weight->device().is_cpu() ? *weight : weight->cpu())
+      : std::nullopt;
+
+  auto [output_cpu, total_weight_cpu] = at::nll_loss_forward_symint(
+      self_cpu,
+      target_cpu,
+      weight_cpu,
+      reduction,
+      ignore_index);
+
+  return std::make_tuple(output_cpu.vulkan(), total_weight_cpu.vulkan());
+}
+
+std::tuple<Tensor&, Tensor&> nll_loss_forward_output(
+    const Tensor& self,
+    const Tensor& target,
+    const std::optional<Tensor>& weight,
+    int64_t reduction,
+    c10::SymInt ignore_index,
+    Tensor& output,
+    Tensor& total_weight) {
+  auto [output_bridge, total_weight_bridge] = nll_loss_forward(
+      self,
+      target,
+      weight,
+      reduction,
+      ignore_index);
+  output.copy_(output_bridge);
+  total_weight.copy_(total_weight_bridge);
+  return std::tuple<Tensor&, Tensor&>{output, total_weight};
+}
+
 #ifdef USE_VULKAN_API
 
 TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
@@ -461,6 +505,10 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("aten::embedding_dense_backward"),
       TORCH_FN(embedding_dense_backward));
+  m.impl(TORCH_SELECTIVE_NAME("aten::nll_loss_forward"), TORCH_FN(nll_loss_forward));
+  m.impl(
+      TORCH_SELECTIVE_NAME("aten::nll_loss_forward.output"),
+      TORCH_FN(nll_loss_forward_output));
 }
 
 #endif /* USE_VULKAN_API */
