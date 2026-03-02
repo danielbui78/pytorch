@@ -61,16 +61,6 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
         return value[0] != '0';
     }
 
-        const bool cfc_trigger =
-            input.dim() == 2 && weight.dim() == 2 && input.size(1) == 128 &&
-            weight.size(0) == 128 && weight.size(1) == 32 &&
-            bias.numel() == 32;
-
-        const bool attn_outproj_trigger =
-            input.dim() == 2 && weight.dim() == 2 && input.size(0) == 256 &&
-            input.size(1) == 512 && weight.size(0) == 512 &&
-            weight.size(1) == 512 && bias.numel() == 512;
-
                 const bool gpt_projection_family_trigger =
                     input.dim() == 2 && weight.dim() == 2 &&
                     input.size(0) <= 256 && input.size(0) > 0 &&
@@ -80,8 +70,7 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
                      weight.size(1) == input.size(1) * 4 ||
                      input.size(1) == weight.size(1) * 4);
 
-                return cfc_trigger || attn_outproj_trigger ||
-                    gpt_projection_family_trigger;
+                return gpt_projection_family_trigger;
 }
 
 inline bool addmm_trace_enabled() {
