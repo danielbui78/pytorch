@@ -8,6 +8,7 @@
 #include <ATen/native/vulkan/impl/Packing.h>
 #include <atomic>
 #include <c10/util/irange.h>
+#include <cstring>
 #include <cstdio>
 
 #include <cstdlib>
@@ -83,6 +84,30 @@ inline bool addmm_trace_enabled() {
 inline int64_t next_addmm_trace_id() {
     static std::atomic<int64_t> counter{0};
     return ++counter;
+}
+
+enum class AddmmOutputArithmeticMode {
+    Default,
+    SkipOutputMul,
+    SkipBiasAdd,
+    Identity,
+};
+
+inline AddmmOutputArithmeticMode addmm_output_arithmetic_mode() {
+    const char* env = std::getenv("PYTORCH_VULKAN_ADDMM_OUTPUT_ARITH_MODE");
+    if (env == nullptr || env[0] == '\0') {
+        return AddmmOutputArithmeticMode::Default;
+    }
+    if (std::strcmp(env, "skip_output_mul") == 0) {
+        return AddmmOutputArithmeticMode::SkipOutputMul;
+    }
+    if (std::strcmp(env, "skip_bias_add") == 0) {
+        return AddmmOutputArithmeticMode::SkipBiasAdd;
+    }
+    if (std::strcmp(env, "identity") == 0) {
+        return AddmmOutputArithmeticMode::Identity;
+    }
+    return AddmmOutputArithmeticMode::Default;
 }
 
 inline bool buffer_dtype_supported(const vTensor& v_tensor) {
@@ -1230,20 +1255,29 @@ Tensor run_addmm_context(
     }
 
   // addmm operation, multiplying the alpha and adding bias.
+    const AddmmOutputArithmeticMode arith_mode = addmm_output_arithmetic_mode();
     if (trace_on) {
         std::fprintf(
                 stderr,
-                "[vk_addmm_trace] id=%lld event=before_output_arithmetic\n",
-                static_cast<long long>(trace_id));
+                "[vk_addmm_trace] id=%lld event=before_output_arithmetic mode=%d\n",
+                static_cast<long long>(trace_id),
+                static_cast<int>(arith_mode));
         std::fflush(stderr);
     }
-  output = output.mul(alpha).add(convert(packed_v_bias).mul(beta));
+    if (arith_mode == AddmmOutputArithmeticMode::Default) {
+        output = output.mul(alpha).add(convert(packed_v_bias).mul(beta));
+    } else if (arith_mode == AddmmOutputArithmeticMode::SkipOutputMul) {
+        output = output.add(convert(packed_v_bias).mul(beta));
+    } else if (arith_mode == AddmmOutputArithmeticMode::SkipBiasAdd) {
+        output = output.mul(alpha);
+    }
 
     if (trace_on) {
         std::fprintf(
                 stderr,
-                "[vk_addmm_trace] id=%lld event=after_output_arithmetic\n",
-                static_cast<long long>(trace_id));
+                "[vk_addmm_trace] id=%lld event=after_output_arithmetic mode=%d\n",
+                static_cast<long long>(trace_id),
+                static_cast<int>(arith_mode));
         std::fflush(stderr);
     }
 
