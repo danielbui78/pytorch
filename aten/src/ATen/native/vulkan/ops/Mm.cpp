@@ -7,6 +7,7 @@
 #include <ATen/native/vulkan/api/Types.h>
 #include <ATen/native/vulkan/impl/Packing.h>
 #include <atomic>
+#include <cctype>
 #include <c10/util/irange.h>
 #include <cstring>
 #include <cstdio>
@@ -98,6 +99,53 @@ inline bool addmm_is_target_callsite_192x2048_2048x512(
     return input.dim() == 2 && weight.dim() == 2 && input.size(0) == 192 &&
             input.size(1) == 2048 && weight.size(0) == 2048 &&
             weight.size(1) == 512 && bias.numel() == 512;
+}
+
+struct AddmmTraceIdRange {
+    bool enabled;
+    int64_t start;
+    int64_t end;
+};
+
+inline AddmmTraceIdRange addmm_target_prelaunch_id_range() {
+    static const AddmmTraceIdRange range = []() {
+        const char* env =
+                std::getenv("PYTORCH_VULKAN_ADDMM_TARGET_PRELAUNCH_ID_RANGE");
+        if (env == nullptr || env[0] == '\0') {
+            return AddmmTraceIdRange{false, 0, 0};
+        }
+
+        while (*env != '\0' && std::isspace(static_cast<unsigned char>(*env))) {
+            ++env;
+        }
+
+        char* end_ptr = nullptr;
+        int64_t parsed_start = std::strtoll(env, &end_ptr, 10);
+        if (end_ptr == env) {
+            return AddmmTraceIdRange{false, 0, 0};
+        }
+
+        int64_t parsed_end = parsed_start;
+        if (*end_ptr == ':') {
+            const char* rhs = end_ptr + 1;
+            char* rhs_end_ptr = nullptr;
+            parsed_end = std::strtoll(rhs, &rhs_end_ptr, 10);
+            if (rhs_end_ptr == rhs || *rhs_end_ptr != '\0') {
+                return AddmmTraceIdRange{false, 0, 0};
+            }
+        } else if (*end_ptr != '\0') {
+            return AddmmTraceIdRange{false, 0, 0};
+        }
+
+        if (parsed_start > parsed_end) {
+            const int64_t tmp = parsed_start;
+            parsed_start = parsed_end;
+            parsed_end = tmp;
+        }
+
+        return AddmmTraceIdRange{true, parsed_start, parsed_end};
+    }();
+    return range;
 }
 
 enum class AddmmOutputArithmeticMode {
@@ -1164,6 +1212,38 @@ Tensor run_addmm_context(
       packed_v_weight.gpu_memory_layout() ==
           api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
       "run_addmm_context must have height packed weight");
+
+    const AddmmTraceIdRange prelaunch_id_range = addmm_target_prelaunch_id_range();
+    if (prelaunch_id_range.enabled && trace_id >= prelaunch_id_range.start &&
+            trace_id <= prelaunch_id_range.end) {
+        if (trace_on) {
+            std::fprintf(
+                    stderr,
+                    "[vk_addmm_trace] id=%lld event=target_prelaunch_id_range_zero start=%lld end=%lld\n",
+                    static_cast<long long>(trace_id),
+                    static_cast<long long>(prelaunch_id_range.start),
+                    static_cast<long long>(prelaunch_id_range.end));
+            std::fflush(stderr);
+        }
+
+        Tensor output = at::zeros(
+                {
+                        input_arg_2d.sizes()[Layout::Parameter::height],
+                        unpacked_weight_sizes[Layout::Parameter::width],
+                },
+                input.options().device(at::kVulkan).dtype(input.scalar_type()));
+
+        if (input_arg.dim() == 2) {
+            return output;
+        }
+
+        std::vector<int64_t> shape;
+        for (const auto i : c10::irange(input_arg.dim() - 1)) {
+            shape.emplace_back(input_arg.size(i));
+        }
+        shape.emplace_back(output.size(-1));
+        return output.reshape(shape);
+    }
 
   if (trace_on) {
     std::fprintf(
