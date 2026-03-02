@@ -6,7 +6,9 @@
 #include <ATen/native/vulkan/api/Tensor.h>
 #include <ATen/native/vulkan/api/Types.h>
 #include <ATen/native/vulkan/impl/Packing.h>
+#include <atomic>
 #include <c10/util/irange.h>
+#include <cstdio>
 
 #include <cstdlib>
 
@@ -68,6 +70,19 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
             weight.size(1) == 512 && bias.numel() == 512;
 
         return cfc_trigger || attn_outproj_trigger;
+}
+
+inline bool addmm_trace_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("PYTORCH_VULKAN_ADDMM_TRACE");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+inline int64_t next_addmm_trace_id() {
+    static std::atomic<int64_t> counter{0};
+    return ++counter;
 }
 
 inline bool buffer_dtype_supported(const vTensor& v_tensor) {
@@ -1063,6 +1078,23 @@ Tensor run_addmm_context(
   }
 
   api::Context* const context = api::context();
+    const bool trace_on = addmm_trace_enabled();
+    const int64_t trace_id = trace_on ? next_addmm_trace_id() : 0;
+
+    if (trace_on) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] id=%lld event=enter input_dim=%lld input_h=%lld input_w=%lld alpha=%.4f beta=%.4f\n",
+                static_cast<long long>(trace_id),
+                static_cast<long long>(input_arg.dim()),
+                static_cast<long long>(
+                        input_arg.dim() >= 2 ? input_arg.sizes()[input_arg.dim() - 2] : -1),
+                static_cast<long long>(
+                        input_arg.dim() >= 1 ? input_arg.sizes()[input_arg.dim() - 1] : -1),
+                alpha,
+                beta);
+        std::fflush(stderr);
+    }
 
   const Tensor input_arg_2d =
       input_arg.dim() == 2 ? input_arg : reshape_to_2d(input_arg);
@@ -1094,6 +1126,23 @@ Tensor run_addmm_context(
           api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
       "run_addmm_context must have height packed weight");
 
+  if (trace_on) {
+    std::fprintf(
+        stderr,
+        "[vk_addmm_trace] id=%lld event=packed_ready weight_h=%lld weight_w=%lld bias_numel=%lld\n",
+        static_cast<long long>(trace_id),
+        static_cast<long long>(
+            unpacked_weight_sizes.size() > 0
+                ? unpacked_weight_sizes[Layout::Parameter::height]
+                : -1),
+        static_cast<long long>(
+            unpacked_weight_sizes.size() > 1
+                ? unpacked_weight_sizes[Layout::Parameter::width]
+                : -1),
+        static_cast<long long>(packed_v_bias.gpu_numel()));
+    std::fflush(stderr);
+  }
+
   vTensor v_output{
       context,
       {
@@ -1119,6 +1168,14 @@ Tensor run_addmm_context(
   compute_shader = VK_KERNEL(mm);
 
   api::PipelineBarrier pipeline_barrier{};
+
+    if (trace_on) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] id=%lld event=before_submit\n",
+                static_cast<long long>(trace_id));
+        std::fflush(stderr);
+    }
 
   context->submit_compute_job(
       // shader descriptor
@@ -1147,10 +1204,48 @@ Tensor run_addmm_context(
       // params buffer
       params.buffer());
 
+    if (trace_on) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] id=%lld event=after_submit\n",
+                static_cast<long long>(trace_id));
+        std::fflush(stderr);
+    }
+
+    if (trace_on) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] id=%lld event=before_convert_output\n",
+                static_cast<long long>(trace_id));
+        std::fflush(stderr);
+    }
   Tensor output = convert(v_output);
 
+    if (trace_on) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] id=%lld event=after_convert_output\n",
+                static_cast<long long>(trace_id));
+        std::fflush(stderr);
+    }
+
   // addmm operation, multiplying the alpha and adding bias.
+    if (trace_on) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] id=%lld event=before_output_arithmetic\n",
+                static_cast<long long>(trace_id));
+        std::fflush(stderr);
+    }
   output = output.mul(alpha).add(convert(packed_v_bias).mul(beta));
+
+    if (trace_on) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] id=%lld event=after_output_arithmetic\n",
+                static_cast<long long>(trace_id));
+        std::fflush(stderr);
+    }
 
   if (input_arg.dim() == 2) {
     return output;
@@ -1310,9 +1405,29 @@ Tensor addmm(
 
   Tensor context_weight = weight;
   Tensor context_bias = bias;
-  if (addmm_force_context_cpu_roundtrip_enabled(input, weight, bias)) {
+    const bool force_context_roundtrip =
+            addmm_force_context_cpu_roundtrip_enabled(input, weight, bias);
+    if (addmm_trace_enabled()) {
+        std::fprintf(
+                stderr,
+                "[vk_addmm_trace] event=addmm_entry input_h=%lld input_w=%lld weight_h=%lld weight_w=%lld bias_numel=%lld force_context_roundtrip=%d\n",
+                static_cast<long long>(input.size(0)),
+                static_cast<long long>(input.size(1)),
+                static_cast<long long>(weight.size(0)),
+                static_cast<long long>(weight.size(1)),
+                static_cast<long long>(bias.numel()),
+                force_context_roundtrip ? 1 : 0);
+        std::fflush(stderr);
+    }
+    if (force_context_roundtrip) {
     context_weight = weight.cpu().contiguous().vulkan();
     context_bias = bias.cpu().contiguous().vulkan();
+        if (addmm_trace_enabled()) {
+            std::fprintf(
+                    stderr,
+                    "[vk_addmm_trace] event=addmm_after_context_roundtrip\n");
+            std::fflush(stderr);
+        }
   }
 
   return run_addmm_context(
