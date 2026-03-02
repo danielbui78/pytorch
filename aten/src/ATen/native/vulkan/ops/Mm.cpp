@@ -86,6 +86,20 @@ inline int64_t next_addmm_trace_id() {
     return ++counter;
 }
 
+inline bool env_true(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+inline bool addmm_is_target_callsite_192x2048_2048x512(
+        const Tensor& input,
+        const Tensor& weight,
+        const Tensor& bias) {
+    return input.dim() == 2 && weight.dim() == 2 && input.size(0) == 192 &&
+            input.size(1) == 2048 && weight.size(0) == 2048 &&
+            weight.size(1) == 512 && bias.numel() == 512;
+}
+
 enum class AddmmOutputArithmeticMode {
     Default,
     SkipOutputMul,
@@ -1439,6 +1453,8 @@ Tensor addmm(
 
   Tensor context_weight = weight;
   Tensor context_bias = bias;
+  const bool target_callsite_192x2048_2048x512 =
+      addmm_is_target_callsite_192x2048_2048x512(input, weight, bias);
     const bool force_context_roundtrip =
             addmm_force_context_cpu_roundtrip_enabled(input, weight, bias);
     if (addmm_trace_enabled()) {
@@ -1452,6 +1468,12 @@ Tensor addmm(
                 static_cast<long long>(bias.numel()),
                 force_context_roundtrip ? 1 : 0);
         std::fflush(stderr);
+        if (target_callsite_192x2048_2048x512) {
+            std::fprintf(
+                    stderr,
+                    "[vk_addmm_trace] event=target_callsite_192x2048_2048x512\n");
+            std::fflush(stderr);
+        }
     }
     if (force_context_roundtrip) {
     context_weight = weight.cpu().contiguous().vulkan();
@@ -1464,7 +1486,20 @@ Tensor addmm(
         }
   }
 
-  return run_addmm_context(
+    if (target_callsite_192x2048_2048x512 &&
+            env_true("PYTORCH_VULKAN_ADDMM_TARGET_PRELAUNCH_ZERO")) {
+        if (addmm_trace_enabled()) {
+            std::fprintf(
+                    stderr,
+                    "[vk_addmm_trace] event=target_prelaunch_zero\n");
+            std::fflush(stderr);
+        }
+        return at::zeros(
+                {input.size(0), weight.size(1)},
+                input.options().device(at::kVulkan).dtype(input.scalar_type()));
+    }
+
+    Tensor result = run_addmm_context(
       input,
       alpha_f,
       beta_f,
@@ -1473,6 +1508,19 @@ Tensor addmm(
       false,
       0,
       0);
+
+    if (target_callsite_192x2048_2048x512 &&
+            env_true("PYTORCH_VULKAN_ADDMM_TARGET_POSTRETURN_ZERO")) {
+        if (addmm_trace_enabled()) {
+            std::fprintf(
+                    stderr,
+                    "[vk_addmm_trace] event=target_postreturn_zero\n");
+            std::fflush(stderr);
+        }
+        return at::zeros_like(result);
+    }
+
+    return result;
 }
 
 Tensor mm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
