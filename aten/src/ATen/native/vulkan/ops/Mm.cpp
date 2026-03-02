@@ -93,8 +93,23 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
                          (input.size(0) == 256 && input.size(1) == 1024 &&
                             weight.size(0) == 1024 && weight.size(1) == 256));
 
+                const bool blk256_e1024_trigger =
+                        input.dim() == 2 && weight.dim() == 2 &&
+                        ((input.size(0) == 256 && input.size(1) == 1024 &&
+                            weight.size(0) == 1024 &&
+                            (weight.size(1) == 1024 || weight.size(1) == 3072 ||
+                             weight.size(1) == 4096)) ||
+                         (input.size(0) == 256 && input.size(1) == 4096 &&
+                            weight.size(0) == 4096 && weight.size(1) == 1024) ||
+                         (input.size(0) == 1024 && input.size(1) == 256 &&
+                            weight.size(0) == 256 &&
+                            (weight.size(1) == 1024 || weight.size(1) == 3072 ||
+                             weight.size(1) == 4096)) ||
+                         (input.size(0) == 4096 && input.size(1) == 256 &&
+                            weight.size(0) == 256 && weight.size(1) == 1024));
+
                 return cfc_trigger || attn_outproj_trigger || blk192_e512_trigger ||
-                        blk256_e256_trigger;
+                        blk256_e256_trigger || blk256_e1024_trigger;
 }
 
 inline bool addmm_trace_enabled() {
