@@ -71,7 +71,20 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
             input.size(1) == 512 && weight.size(0) == 512 &&
             weight.size(1) == 512 && bias.numel() == 512;
 
-        return cfc_trigger || attn_outproj_trigger;
+                const bool blk192_e512_trigger =
+                        input.dim() == 2 && weight.dim() == 2 &&
+                        ((input.size(0) == 192 &&
+                            (input.size(1) == 512 || input.size(1) == 1536 ||
+                             input.size(1) == 2048) &&
+                            weight.size(0) == input.size(1) && weight.size(1) == 512) ||
+                         (input.size(0) == 512 && input.size(1) == 192 &&
+                            weight.size(0) == 192 &&
+                            (weight.size(1) == 512 || weight.size(1) == 1536 ||
+                             weight.size(1) == 2048)) ||
+                         (input.size(0) == 2048 && input.size(1) == 192 &&
+                            weight.size(0) == 192 && weight.size(1) == 512));
+
+                return cfc_trigger || attn_outproj_trigger || blk192_e512_trigger;
 }
 
 inline bool addmm_trace_enabled() {
