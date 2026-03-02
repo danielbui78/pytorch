@@ -57,8 +57,17 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
         return value[0] != '0';
     }
 
-    return input.dim() == 2 && weight.dim() == 2 && input.size(1) == 128 &&
-            weight.size(0) == 128 && weight.size(1) == 32 && bias.numel() == 32;
+        const bool cfc_trigger =
+            input.dim() == 2 && weight.dim() == 2 && input.size(1) == 128 &&
+            weight.size(0) == 128 && weight.size(1) == 32 &&
+            bias.numel() == 32;
+
+        const bool attn_outproj_trigger =
+            input.dim() == 2 && weight.dim() == 2 && input.size(0) == 256 &&
+            input.size(1) == 512 && weight.size(0) == 512 &&
+            weight.size(1) == 512 && bias.numel() == 512;
+
+        return cfc_trigger || attn_outproj_trigger;
 }
 
 inline bool buffer_dtype_supported(const vTensor& v_tensor) {
