@@ -92,6 +92,56 @@ uint64_t device_local_headroom_bytes(VmaAllocator allocator) {
   return max_headroom;
 }
 
+bool heap_has_host_visible_type(
+    const VkPhysicalDeviceMemoryProperties* mem_props,
+    const uint32_t heap_idx) {
+  for (uint32_t type_idx = 0; type_idx < mem_props->memoryTypeCount; ++type_idx) {
+    const VkMemoryType& type = mem_props->memoryTypes[type_idx];
+    if (type.heapIndex != heap_idx) {
+      continue;
+    }
+    if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint64_t dedicated_device_local_headroom_bytes(VmaAllocator allocator) {
+  const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
+  vmaGetMemoryProperties(allocator, &mem_props);
+
+  VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+  vmaGetHeapBudgets(allocator, budgets);
+
+  uint64_t selected_heap_size = 0ull;
+  uint64_t selected_headroom = 0ull;
+
+  for (uint32_t heap_idx = 0; heap_idx < mem_props->memoryHeapCount; ++heap_idx) {
+    const VkMemoryHeap& heap = mem_props->memoryHeaps[heap_idx];
+    if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0u) {
+      continue;
+    }
+    if (heap_has_host_visible_type(mem_props, heap_idx)) {
+      continue;
+    }
+
+    const uint64_t budget = static_cast<uint64_t>(budgets[heap_idx].budget);
+    const uint64_t usage = static_cast<uint64_t>(budgets[heap_idx].usage);
+    const uint64_t heap_size = static_cast<uint64_t>(heap.size);
+    const uint64_t effective_budget = budget > 0ull ? budget : heap_size;
+    const uint64_t headroom =
+        usage < effective_budget ? (effective_budget - usage) : 0ull;
+
+    if (heap_size > selected_heap_size) {
+      selected_heap_size = heap_size;
+      selected_headroom = headroom;
+    }
+  }
+
+  return selected_headroom;
+}
+
 bool try_flush_pending_cleanup(const char* reason, const uint64_t request_bytes) {
   ::at::native::vulkan::api::Context* context_p =
       ::at::native::vulkan::api::context();
@@ -120,18 +170,33 @@ bool try_flush_pending_cleanup(const char* reason, const uint64_t request_bytes)
 
 void maybe_pressure_flush_before_alloc(
     VmaAllocator allocator,
+    const VmaAllocationCreateInfo& alloc_create_info,
     const uint64_t request_bytes) {
   if (!alloc_pressure_flush_enabled()) {
     return;
   }
 
-  const uint64_t headroom = device_local_headroom_bytes(allocator);
   const uint64_t required = request_bytes + alloc_pressure_margin_bytes();
-  if (headroom >= required) {
-    return;
+
+  const bool prefers_device_local =
+      alloc_create_info.usage == VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE &&
+      (alloc_create_info.requiredFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ==
+          0u;
+
+  if (prefers_device_local) {
+    const uint64_t dedicated_headroom =
+        dedicated_device_local_headroom_bytes(allocator);
+    if (dedicated_headroom > 0ull && dedicated_headroom < required) {
+      if (try_flush_pending_cleanup("dedicated_headroom", request_bytes)) {
+        return;
+      }
+    }
   }
 
-  try_flush_pending_cleanup("headroom", request_bytes);
+  const uint64_t headroom = device_local_headroom_bytes(allocator);
+  if (headroom < required) {
+    try_flush_pending_cleanup("headroom", request_bytes);
+  }
 }
 
 } // namespace
@@ -251,7 +316,8 @@ VulkanBuffer::VulkanBuffer(
   memory_.create_info = allocation_create_info;
 
   if (allocate_memory) {
-    maybe_pressure_flush_before_alloc(allocator_, static_cast<uint64_t>(size));
+    maybe_pressure_flush_before_alloc(
+      allocator_, allocation_create_info, static_cast<uint64_t>(size));
 
     const bool allow_host_retry =
         (buffer_properties_.buffer_usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) &&
@@ -584,7 +650,8 @@ VulkanImage::VulkanImage(
         image_properties_.image_extents.width) *
         static_cast<uint64_t>(image_properties_.image_extents.height) *
         static_cast<uint64_t>(image_properties_.image_extents.depth) * 4ull;
-    maybe_pressure_flush_before_alloc(allocator_, request_bytes);
+    maybe_pressure_flush_before_alloc(
+      allocator_, allocation_create_info, request_bytes);
 
     VkResult alloc_result = vmaCreateImage(
         allocator_,
