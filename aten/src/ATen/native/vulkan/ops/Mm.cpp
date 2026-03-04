@@ -122,10 +122,23 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
         const Tensor& input,
         const Tensor& weight,
         const Tensor& bias) {
-    const char* value =
-            std::getenv("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP");
-    if (value != nullptr && value[0] != '\0') {
-        return value[0] != '0';
+    const auto env_override_active = [](const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+    };
+
+    const bool env_force_on =
+        env_override_active(
+            "PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP_ON") ||
+        env_override_active("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP");
+    const bool env_force_off = env_override_active(
+        "PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP_OFF");
+
+    if (env_force_off) {
+    return false;
+    }
+    if (env_force_on) {
+    return true;
     }
 
                 const bool gpt_projection_family_trigger =
@@ -155,9 +168,13 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
 }
 
 inline bool addmm_force_context_cpu_roundtrip_env_override_active() {
-    const char* value =
-            std::getenv("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP");
-    return value != nullptr && value[0] != '\0';
+    const auto env_override_active = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    };
+    return env_override_active("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP_ON") ||
+        env_override_active("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP_OFF") ||
+        env_override_active("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP");
 }
 
 inline bool addmm_pre_flush_enabled() {
@@ -202,6 +219,15 @@ inline const char* addmm_force_context_roundtrip_reason(
         const Tensor& input,
         const Tensor& weight,
         const bool force_context_roundtrip) {
+    const auto env_override_active = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    };
+
+    if (env_override_active("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP_OFF")) {
+        return "env_force_off";
+    }
+
     if (addmm_force_context_cpu_roundtrip_env_override_active()) {
         return force_context_roundtrip ? "env_force_on" : "env_force_off";
     }
