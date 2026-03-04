@@ -168,6 +168,36 @@ inline bool addmm_pre_flush_enabled() {
     return enabled;
 }
 
+inline int64_t addmm_pre_flush_period() {
+    static const int64_t period = []() {
+        const char* value = std::getenv("PYTORCH_VULKAN_ADDMM_PRE_FLUSH_PERIOD");
+        if (value == nullptr || value[0] == '\0') {
+            return int64_t{1};
+        }
+
+        char* parse_end = nullptr;
+        const long parsed = std::strtol(value, &parse_end, 10);
+        if (parse_end == value || *parse_end != '\0' || parsed <= 0) {
+            return int64_t{1};
+        }
+
+        return static_cast<int64_t>(parsed);
+    }();
+    return period;
+}
+
+inline bool addmm_should_pre_flush() {
+    if (!addmm_pre_flush_enabled()) {
+        return false;
+    }
+
+    static thread_local int64_t addmm_pre_flush_index = 0;
+    ++addmm_pre_flush_index;
+
+    const int64_t period = addmm_pre_flush_period();
+    return period <= 1 || (addmm_pre_flush_index % period) == 0;
+}
+
 inline const char* addmm_force_context_roundtrip_reason(
         const Tensor& input,
         const Tensor& weight,
@@ -1754,14 +1784,17 @@ Tensor addmm(
                 input.options().device(at::kVulkan).dtype(input.scalar_type()));
     }
 
-    if (addmm_pre_flush_enabled()) {
+    if (addmm_should_pre_flush()) {
         api::Context* const context = api::context();
         if (context != nullptr) {
             std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
             context->submit_cmd_to_gpu(VK_NULL_HANDLE);
             context->flush();
             if (addmm_trace_enabled()) {
-                std::fprintf(stderr, "[vk_addmm_trace] event=addmm_pre_flush\n");
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_pre_flush period=%lld\n",
+                        static_cast<long long>(addmm_pre_flush_period()));
                 std::fflush(stderr);
             }
         }
