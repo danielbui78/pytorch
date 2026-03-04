@@ -51,6 +51,73 @@ inline bool fp16_buffer_storage_enabled() {
   return api::context()->fp16_buffer_storage_enabled();
 }
 
+struct AddmmIndexRange {
+    bool enabled;
+    int64_t start;
+    int64_t end;
+};
+
+inline AddmmIndexRange addmm_force_context_x4_index_range() {
+    static const AddmmIndexRange range = []() {
+        const char* env =
+                std::getenv("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_X4_INDEX_RANGE");
+        if (env == nullptr || env[0] == '\0') {
+            return AddmmIndexRange{false, 0, 0};
+        }
+
+        while (*env != '\0' && std::isspace(static_cast<unsigned char>(*env))) {
+            ++env;
+        }
+
+        char* end_ptr = nullptr;
+        int64_t parsed_start = std::strtoll(env, &end_ptr, 10);
+        if (end_ptr == env) {
+            return AddmmIndexRange{false, 0, 0};
+        }
+
+        int64_t parsed_end = parsed_start;
+        if (*end_ptr == ':') {
+            const char* rhs = end_ptr + 1;
+            char* rhs_end_ptr = nullptr;
+            parsed_end = std::strtoll(rhs, &rhs_end_ptr, 10);
+            if (rhs_end_ptr == rhs || *rhs_end_ptr != '\0') {
+                return AddmmIndexRange{false, 0, 0};
+            }
+        } else if (*end_ptr != '\0') {
+            return AddmmIndexRange{false, 0, 0};
+        }
+
+        if (parsed_start > parsed_end) {
+            const int64_t tmp = parsed_start;
+            parsed_start = parsed_end;
+            parsed_end = tmp;
+        }
+
+        return AddmmIndexRange{true, parsed_start, parsed_end};
+    }();
+    return range;
+}
+
+inline bool addmm_projection_x4_contract(
+        const Tensor& input,
+        const Tensor& weight) {
+    return input.dim() == 2 && weight.dim() == 2 && input.size(0) > 0 &&
+            input.size(1) > 0 && weight.size(0) == input.size(1) &&
+            (weight.size(1) == input.size(1) * 4);
+}
+
+inline bool addmm_projection_x4_highrow_narrow_trigger(
+        const Tensor& input,
+        const Tensor& weight) {
+    if (!addmm_projection_x4_contract(input, weight)) {
+        return false;
+    }
+
+    constexpr int64_t kHighRowMin = 257;
+    constexpr int64_t kHighRowMax = 8192;
+    return input.size(0) >= kHighRowMin && input.size(0) <= kHighRowMax;
+}
+
 inline bool addmm_force_context_cpu_roundtrip_enabled(
         const Tensor& input,
         const Tensor& weight,
@@ -62,12 +129,94 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
     }
 
                 const bool gpt_projection_family_trigger =
-                    input.dim() == 2 && weight.dim() == 2 &&
-                    input.size(0) <= 256 && input.size(0) > 0 &&
-                    input.size(1) > 0 && weight.size(0) == input.size(1) &&
-                    (weight.size(1) == input.size(1) * 4);
+                        addmm_projection_x4_contract(input, weight) &&
+                        input.size(0) <= 256;
 
-                return gpt_projection_family_trigger;
+                if (!gpt_projection_family_trigger) {
+                    return addmm_projection_x4_highrow_narrow_trigger(
+                            input,
+                            weight);
+                }
+
+                static thread_local int64_t x4_index = 0;
+                ++x4_index;
+
+                const AddmmIndexRange x4_range =
+                        addmm_force_context_x4_index_range();
+                if (x4_range.enabled) {
+                    return x4_index >= x4_range.start &&
+                            x4_index <= x4_range.end;
+                }
+
+                constexpr int64_t kDefaultX4ForceMinIndex = 8;
+                constexpr int64_t kDefaultX4ForceMaxIndex = 118;
+                return x4_index >= kDefaultX4ForceMinIndex &&
+                    x4_index <= kDefaultX4ForceMaxIndex;
+}
+
+inline bool addmm_force_context_cpu_roundtrip_env_override_active() {
+    const char* value =
+            std::getenv("PYTORCH_VULKAN_ADDMM_FORCE_CONTEXT_CPU_ROUNDTRIP");
+    return value != nullptr && value[0] != '\0';
+}
+
+inline const char* addmm_force_context_roundtrip_reason(
+        const Tensor& input,
+        const Tensor& weight,
+        const bool force_context_roundtrip) {
+    if (addmm_force_context_cpu_roundtrip_env_override_active()) {
+        return force_context_roundtrip ? "env_force_on" : "env_force_off";
+    }
+
+    const bool gpt_projection_family_trigger =
+            addmm_projection_x4_contract(input, weight) && input.size(0) <= 256;
+    const bool gpt_projection_family_highrow_trigger =
+            addmm_projection_x4_highrow_narrow_trigger(input, weight);
+
+    if (force_context_roundtrip && gpt_projection_family_trigger) {
+        if (addmm_force_context_x4_index_range().enabled) {
+            return "projection_x4_range";
+        }
+        return "projection_x4";
+    }
+
+    if (force_context_roundtrip && gpt_projection_family_highrow_trigger) {
+        return "projection_x4_highrow";
+    }
+
+    return "none";
+}
+
+inline const char* addmm_role_hint(const Tensor& input, const Tensor& weight) {
+    if (input.dim() != 2 || weight.dim() != 2) {
+        return "non_2d";
+    }
+
+    if (input.size(1) <= 0 || weight.size(0) != input.size(1)) {
+        return "non_contract";
+    }
+
+    if (weight.size(1) == input.size(1) * 4) {
+        return "mlp_expand_x4";
+    }
+
+    if (input.size(1) == weight.size(1) * 4) {
+        return "mlp_project_div4";
+    }
+
+    if (weight.size(1) == input.size(1)) {
+        return "same_width";
+    }
+
+    if (weight.size(1) == input.size(1) * 3) {
+        return "qkv_expand_x3";
+    }
+
+    if (input.size(1) == weight.size(1) * 3) {
+        return "qkv_project_div3";
+    }
+
+    return "other_2d";
 }
 
 inline bool addmm_trace_enabled() {
@@ -1533,16 +1682,23 @@ Tensor addmm(
       addmm_is_target_callsite_192x2048_2048x512(input, weight, bias);
     const bool force_context_roundtrip =
             addmm_force_context_cpu_roundtrip_enabled(input, weight, bias);
+    const char* force_reason = addmm_force_context_roundtrip_reason(
+        input,
+        weight,
+        force_context_roundtrip);
+    const char* role_hint = addmm_role_hint(input, weight);
     if (addmm_trace_enabled()) {
         std::fprintf(
                 stderr,
-                "[vk_addmm_trace] event=addmm_entry input_h=%lld input_w=%lld weight_h=%lld weight_w=%lld bias_numel=%lld force_context_roundtrip=%d\n",
+        "[vk_addmm_trace] event=addmm_entry input_h=%lld input_w=%lld weight_h=%lld weight_w=%lld bias_numel=%lld force_context_roundtrip=%d force_reason=%s role_hint=%s\n",
                 static_cast<long long>(input.size(0)),
                 static_cast<long long>(input.size(1)),
                 static_cast<long long>(weight.size(0)),
                 static_cast<long long>(weight.size(1)),
                 static_cast<long long>(bias.numel()),
-                force_context_roundtrip ? 1 : 0);
+        force_context_roundtrip ? 1 : 0,
+        force_reason,
+        role_hint);
         std::fflush(stderr);
         if (target_callsite_192x2048_2048x512) {
             std::fprintf(
