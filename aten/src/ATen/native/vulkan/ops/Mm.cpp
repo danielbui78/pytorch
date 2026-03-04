@@ -160,6 +160,14 @@ inline bool addmm_force_context_cpu_roundtrip_env_override_active() {
     return value != nullptr && value[0] != '\0';
 }
 
+inline bool addmm_pre_flush_enabled() {
+    static const bool enabled = []() {
+        const char* value = std::getenv("PYTORCH_VULKAN_ADDMM_PRE_FLUSH");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 inline const char* addmm_force_context_roundtrip_reason(
         const Tensor& input,
         const Tensor& weight,
@@ -384,6 +392,21 @@ vTensor pack_weights_using_height_packing(const Tensor& weight_arg) {
       "After packing, the v_weight must be in TENSOR_HEIGHT_PACKED format");
 
   return v_weight;
+    if (addmm_pre_flush_enabled()) {
+        api::Context* const context = api::context();
+        if (context != nullptr) {
+            std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+            context->submit_cmd_to_gpu(VK_NULL_HANDLE);
+            context->flush();
+            if (addmm_trace_enabled()) {
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_pre_flush\n");
+                std::fflush(stderr);
+            }
+        }
+    }
+
 }
 
 vTensor pack_weights(const Tensor& weight_arg, const bool use_batch = false) {
@@ -1729,6 +1752,19 @@ Tensor addmm(
         return at::zeros(
                 {input.size(0), weight.size(1)},
                 input.options().device(at::kVulkan).dtype(input.scalar_type()));
+    }
+
+    if (addmm_pre_flush_enabled()) {
+        api::Context* const context = api::context();
+        if (context != nullptr) {
+            std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+            context->submit_cmd_to_gpu(VK_NULL_HANDLE);
+            context->flush();
+            if (addmm_trace_enabled()) {
+                std::fprintf(stderr, "[vk_addmm_trace] event=addmm_pre_flush\n");
+                std::fflush(stderr);
+            }
+        }
     }
 
     Tensor result = run_addmm_context(
