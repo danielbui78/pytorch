@@ -65,8 +65,7 @@ inline bool addmm_force_context_cpu_roundtrip_enabled(
                     input.dim() == 2 && weight.dim() == 2 &&
                     input.size(0) <= 256 && input.size(0) > 0 &&
                     input.size(1) > 0 && weight.size(0) == input.size(1) &&
-                    (weight.size(1) == input.size(1) * 3 ||
-                     weight.size(1) == input.size(1) * 4 ||
+                    (weight.size(1) == input.size(1) * 4 ||
                      input.size(1) == weight.size(1) * 4);
 
                 return gpt_projection_family_trigger;
