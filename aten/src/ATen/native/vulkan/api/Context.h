@@ -184,6 +184,16 @@ class Context final {
     return std::unique_lock<std::mutex>(cmd_mutex_);
   }
 
+  inline std::unique_lock<std::mutex> try_dispatch_lock() {
+    return std::unique_lock<std::mutex>(cmd_mutex_, std::try_to_lock);
+  }
+
+  inline bool has_pending_deferred_clear() {
+    std::lock_guard<std::mutex> bufferlist_lock(buffer_clearlist_mutex_);
+    std::lock_guard<std::mutex> imagelist_lock(image_clearlist_mutex_);
+    return !buffers_to_clear_.empty() || !images_to_clear_.empty();
+  }
+
   inline void set_cmd(bool reusable = false) {
     if (!cmd_) {
       cmd_ = command_pool_.get_new_cmd(reusable);

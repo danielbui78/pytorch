@@ -1,4 +1,5 @@
 #include <ATen/native/vulkan/api/Adapter.h>
+#include <ATen/native/vulkan/api/Context.h>
 #include <ATen/native/vulkan/api/Resource.h>
 
 #include <cstdlib>
@@ -29,6 +30,108 @@ bool has_device_local_host_visible(VmaAllocator allocator) {
     }
   }
   return false;
+}
+
+bool env_true(const char* env_name, const bool default_value = false) {
+  const char* env = std::getenv(env_name);
+  if (!env || env[0] == '\0') {
+    return default_value;
+  }
+  return (
+      env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' ||
+      env[0] == 'Y');
+}
+
+uint64_t env_u64_mb(const char* env_name, const uint64_t default_mb) {
+  const char* env = std::getenv(env_name);
+  if (!env || env[0] == '\0') {
+    return default_mb;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(env, &end, 10);
+  if (!end || *end != '\0') {
+    return default_mb;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
+bool alloc_pressure_flush_enabled() {
+  return env_true("PYTORCH_VULKAN_ALLOC_PRESSURE_FLUSH", true);
+}
+
+uint64_t alloc_pressure_margin_bytes() {
+  return env_u64_mb("PYTORCH_VULKAN_ALLOC_PRESSURE_MARGIN_MB", 64ull) *
+      1024ull * 1024ull;
+}
+
+uint64_t device_local_headroom_bytes(VmaAllocator allocator) {
+  const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
+  vmaGetMemoryProperties(allocator, &mem_props);
+
+  VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+  vmaGetHeapBudgets(allocator, budgets);
+
+  uint64_t max_headroom = 0ull;
+  for (uint32_t heap_idx = 0; heap_idx < mem_props->memoryHeapCount; ++heap_idx) {
+    const VkMemoryHeap& heap = mem_props->memoryHeaps[heap_idx];
+    if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0u) {
+      continue;
+    }
+
+    const uint64_t budget = static_cast<uint64_t>(budgets[heap_idx].budget);
+    const uint64_t usage = static_cast<uint64_t>(budgets[heap_idx].usage);
+    const uint64_t heap_size = static_cast<uint64_t>(heap.size);
+    const uint64_t effective_budget = budget > 0ull ? budget : heap_size;
+    const uint64_t headroom =
+        usage < effective_budget ? (effective_budget - usage) : 0ull;
+    if (headroom > max_headroom) {
+      max_headroom = headroom;
+    }
+  }
+
+  return max_headroom;
+}
+
+bool try_flush_pending_cleanup(const char* reason, const uint64_t request_bytes) {
+  ::at::native::vulkan::api::Context* context_p =
+      ::at::native::vulkan::api::context();
+  if (!context_p || !context_p->has_pending_deferred_clear()) {
+    return false;
+  }
+
+  auto lock = context_p->try_dispatch_lock();
+  if (!lock.owns_lock()) {
+    return false;
+  }
+
+  context_p->submit_cmd_to_gpu(VK_NULL_HANDLE, true);
+  context_p->flush();
+
+  if (alloc_diagnostics_enabled()) {
+    std::fprintf(
+        stdout,
+        "[vulkan_alloc] pressure_flush reason=%s request=%llu\n",
+        reason,
+        static_cast<unsigned long long>(request_bytes));
+  }
+
+  return true;
+}
+
+void maybe_pressure_flush_before_alloc(
+    VmaAllocator allocator,
+    const uint64_t request_bytes) {
+  if (!alloc_pressure_flush_enabled()) {
+    return;
+  }
+
+  const uint64_t headroom = device_local_headroom_bytes(allocator);
+  const uint64_t required = request_bytes + alloc_pressure_margin_bytes();
+  if (headroom >= required) {
+    return;
+  }
+
+  try_flush_pending_cleanup("headroom", request_bytes);
 }
 
 } // namespace
@@ -148,6 +251,8 @@ VulkanBuffer::VulkanBuffer(
   memory_.create_info = allocation_create_info;
 
   if (allocate_memory) {
+    maybe_pressure_flush_before_alloc(allocator_, static_cast<uint64_t>(size));
+
     const bool allow_host_retry =
         (buffer_properties_.buffer_usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) &&
         size >= (1024ull * 1024ull * 1024ull) &&
@@ -160,6 +265,18 @@ VulkanBuffer::VulkanBuffer(
         &handle_,
         &(memory_.allocation),
         nullptr);
+    if (alloc_pressure_flush_enabled() &&
+        alloc_result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+      if (try_flush_pending_cleanup("oom_retry", static_cast<uint64_t>(size))) {
+        alloc_result = vmaCreateBuffer(
+            allocator_,
+            &buffer_create_info,
+            &allocation_create_info,
+            &handle_,
+            &(memory_.allocation),
+            nullptr);
+      }
+    }
     if (alloc_result == VK_ERROR_OUT_OF_DEVICE_MEMORY && allow_host_retry) {
       VmaAllocationCreateInfo host_alloc_info = allocation_create_info;
       host_alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -463,13 +580,32 @@ VulkanImage::VulkanImage(
   memory_.create_info = allocation_create_info;
 
   if (allocate_memory) {
-    VK_CHECK(vmaCreateImage(
+    const uint64_t request_bytes = static_cast<uint64_t>(
+        image_properties_.image_extents.width) *
+        static_cast<uint64_t>(image_properties_.image_extents.height) *
+        static_cast<uint64_t>(image_properties_.image_extents.depth) * 4ull;
+    maybe_pressure_flush_before_alloc(allocator_, request_bytes);
+
+    VkResult alloc_result = vmaCreateImage(
         allocator_,
         &image_create_info,
         &allocation_create_info,
         &(handles_.image),
         &(memory_.allocation),
-        nullptr));
+        nullptr);
+    if (alloc_pressure_flush_enabled() &&
+        alloc_result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+      if (try_flush_pending_cleanup("oom_retry", request_bytes)) {
+        alloc_result = vmaCreateImage(
+            allocator_,
+            &image_create_info,
+            &allocation_create_info,
+            &(handles_.image),
+            &(memory_.allocation),
+            nullptr);
+      }
+    }
+    VK_CHECK(alloc_result);
     // Only create the image view if the image has been bound to memory
     create_image_view();
   } else {
