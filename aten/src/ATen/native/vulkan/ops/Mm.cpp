@@ -1985,7 +1985,7 @@ Tensor addmm(
     const AddmmRoundtripMode requested_roundtrip_mode = addmm_roundtrip_mode();
     const AddmmRoundtripMode effective_roundtrip_mode =
             requested_roundtrip_mode == AddmmRoundtripMode::Auto
-            ? (force_context_roundtrip ? AddmmRoundtripMode::Full
+            ? (force_context_roundtrip ? AddmmRoundtripMode::SubmitFlush
                                        : AddmmRoundtripMode::Off)
             : requested_roundtrip_mode;
     const bool roundtrip_compare_on = addmm_roundtrip_compare_enabled();
