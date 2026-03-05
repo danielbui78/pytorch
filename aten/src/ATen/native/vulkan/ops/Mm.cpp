@@ -9,8 +9,10 @@
 #include <atomic>
 #include <cctype>
 #include <c10/util/irange.h>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 #include <cstdlib>
 
@@ -379,6 +381,179 @@ inline AddmmOutputArithmeticMode addmm_output_arithmetic_mode() {
         return AddmmOutputArithmeticMode::Identity;
     }
     return AddmmOutputArithmeticMode::Default;
+}
+
+inline bool addmm_roundtrip_compare_enabled() {
+    const char* env = std::getenv("PYTORCH_VULKAN_ADDMM_ROUNDTRIP_COMPARE_ON");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+enum class AddmmRoundtripMode {
+    Auto,
+    Off,
+    SyncOnly,
+    CloneOnly,
+    Full,
+};
+
+inline AddmmRoundtripMode addmm_roundtrip_mode() {
+    const char* env = std::getenv("PYTORCH_VULKAN_ADDMM_ROUNDTRIP_MODE");
+    if (env == nullptr || env[0] == '\0') {
+        return AddmmRoundtripMode::Auto;
+    }
+
+    if (std::strcmp(env, "0") == 0 || std::strcmp(env, "off") == 0) {
+        return AddmmRoundtripMode::Off;
+    }
+
+    if (std::strcmp(env, "sync_only") == 0) {
+        return AddmmRoundtripMode::SyncOnly;
+    }
+
+    if (std::strcmp(env, "clone_only") == 0) {
+        return AddmmRoundtripMode::CloneOnly;
+    }
+
+    if (std::strcmp(env, "full") == 0 || std::strcmp(env, "1") == 0 ||
+        std::strcmp(env, "on") == 0) {
+        return AddmmRoundtripMode::Full;
+    }
+
+    // Any non-empty, non-off value acts as an explicit "on" override.
+    return AddmmRoundtripMode::Full;
+}
+
+inline const char* addmm_roundtrip_mode_name(const AddmmRoundtripMode mode) {
+    switch (mode) {
+        case AddmmRoundtripMode::Auto:
+            return "auto";
+        case AddmmRoundtripMode::Off:
+            return "off";
+        case AddmmRoundtripMode::SyncOnly:
+            return "sync_only";
+        case AddmmRoundtripMode::CloneOnly:
+            return "clone_only";
+        case AddmmRoundtripMode::Full:
+            return "full";
+    }
+    return "auto";
+}
+
+inline void addmm_force_sync_boundary() {
+    api::Context* const context = api::context();
+    if (context == nullptr) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+    context->submit_cmd_to_gpu(VK_NULL_HANDLE);
+    context->flush();
+}
+
+inline std::string addmm_intarray_to_string(const IntArrayRef values) {
+    std::string out = "[";
+    for (const auto i : c10::irange(values.size())) {
+        if (i > 0) {
+            out += ",";
+        }
+        out += std::to_string(values[i]);
+    }
+    out += "]";
+    return out;
+}
+
+inline std::uintptr_t addmm_try_data_ptr(
+        const Tensor& tensor,
+        bool* available) {
+    try {
+        const void* ptr = tensor.const_data_ptr();
+        *available = ptr != nullptr;
+        return reinterpret_cast<std::uintptr_t>(ptr);
+    } catch (...) {
+        *available = false;
+        return 0;
+    }
+}
+
+inline void addmm_log_roundtrip_compare_for_tensor(
+        const char* tensor_name,
+        const Tensor& original,
+        const Tensor& roundtripped) {
+    if (!addmm_trace_enabled() || !addmm_roundtrip_compare_enabled()) {
+        return;
+    }
+
+    const std::string original_shape = addmm_intarray_to_string(original.sizes());
+    const std::string roundtripped_shape =
+            addmm_intarray_to_string(roundtripped.sizes());
+    const std::string original_stride =
+            addmm_intarray_to_string(original.strides());
+    const std::string roundtripped_stride =
+            addmm_intarray_to_string(roundtripped.strides());
+    const std::string original_device = original.device().str();
+    const std::string roundtripped_device = roundtripped.device().str();
+
+    bool original_ptr_available = false;
+    bool roundtripped_ptr_available = false;
+    const std::uintptr_t original_ptr =
+            addmm_try_data_ptr(original, &original_ptr_available);
+    const std::uintptr_t roundtripped_ptr =
+            addmm_try_data_ptr(roundtripped, &roundtripped_ptr_available);
+
+    const Tensor original_cpu = original.cpu().contiguous().to(at::kFloat);
+    const Tensor roundtripped_cpu = roundtripped.cpu().contiguous().to(at::kFloat);
+
+    const bool allclose =
+            at::allclose(original_cpu, roundtripped_cpu, 1.0e-5, 1.0e-8, true);
+
+    double max_abs_diff = 0.0;
+    double max_rel_diff = 0.0;
+    int64_t nan_count = 0;
+    int64_t inf_count = 0;
+
+    if (original_cpu.numel() > 0 && roundtripped_cpu.numel() > 0) {
+        const Tensor abs_diff =
+                at::abs(at::sub(original_cpu, roundtripped_cpu));
+        max_abs_diff = abs_diff.max().item<double>();
+
+        const Tensor rel_diff =
+                at::div(abs_diff, at::clamp_min(at::abs(original_cpu), 1.0e-12));
+        max_rel_diff = rel_diff.max().item<double>();
+
+        nan_count = at::isnan(original_cpu).sum().item<int64_t>() +
+            at::isnan(roundtripped_cpu).sum().item<int64_t>();
+        inf_count = at::isinf(original_cpu).sum().item<int64_t>() +
+            at::isinf(roundtripped_cpu).sum().item<int64_t>();
+    }
+
+    std::fprintf(
+            stderr,
+            "[vk_addmm_trace] event=roundtrip_compare tensor=%s original_shape=%s roundtripped_shape=%s original_dtype=%d roundtripped_dtype=%d original_device=%s roundtripped_device=%s original_stride=%s roundtripped_stride=%s original_contiguous=%d roundtripped_contiguous=%d original_storage_offset=%lld roundtripped_storage_offset=%lld original_numel=%lld roundtripped_numel=%lld original_ptr_available=%d original_data_ptr=0x%llx roundtripped_ptr_available=%d roundtripped_data_ptr=0x%llx allclose=%d max_abs_diff=%.9e max_rel_diff=%.9e nan_count=%lld inf_count=%lld\n",
+            tensor_name,
+            original_shape.c_str(),
+            roundtripped_shape.c_str(),
+            static_cast<int>(original.scalar_type()),
+            static_cast<int>(roundtripped.scalar_type()),
+            original_device.c_str(),
+            roundtripped_device.c_str(),
+            original_stride.c_str(),
+            roundtripped_stride.c_str(),
+            original.is_contiguous() ? 1 : 0,
+            roundtripped.is_contiguous() ? 1 : 0,
+            static_cast<long long>(original.storage_offset()),
+            static_cast<long long>(roundtripped.storage_offset()),
+            static_cast<long long>(original.numel()),
+            static_cast<long long>(roundtripped.numel()),
+            original_ptr_available ? 1 : 0,
+            static_cast<unsigned long long>(original_ptr),
+            roundtripped_ptr_available ? 1 : 0,
+            static_cast<unsigned long long>(roundtripped_ptr),
+            allclose ? 1 : 0,
+            max_abs_diff,
+            max_rel_diff,
+            static_cast<long long>(nan_count),
+            static_cast<long long>(inf_count));
+    std::fflush(stderr);
 }
 
 inline bool buffer_dtype_supported(const vTensor& v_tensor) {
@@ -1766,10 +1941,17 @@ Tensor addmm(
         weight,
         force_context_roundtrip);
     const char* role_hint = addmm_role_hint(input, weight);
+    const AddmmRoundtripMode requested_roundtrip_mode = addmm_roundtrip_mode();
+    const AddmmRoundtripMode effective_roundtrip_mode =
+            requested_roundtrip_mode == AddmmRoundtripMode::Auto
+            ? (force_context_roundtrip ? AddmmRoundtripMode::Full
+                                       : AddmmRoundtripMode::Off)
+            : requested_roundtrip_mode;
+    const bool roundtrip_compare_on = addmm_roundtrip_compare_enabled();
     if (addmm_trace_enabled()) {
         std::fprintf(
                 stderr,
-        "[vk_addmm_trace] event=addmm_entry input_h=%lld input_w=%lld weight_h=%lld weight_w=%lld bias_numel=%lld force_context_roundtrip=%d force_reason=%s role_hint=%s\n",
+        "[vk_addmm_trace] event=addmm_entry input_h=%lld input_w=%lld weight_h=%lld weight_w=%lld bias_numel=%lld force_context_roundtrip=%d force_reason=%s role_hint=%s ROUNDTRIP_MODE=%s EFFECTIVE_ROUNDTRIP_MODE=%s ROUNDTRIP_COMPARE_ON=%d\n",
                 static_cast<long long>(input.size(0)),
                 static_cast<long long>(input.size(1)),
                 static_cast<long long>(weight.size(0)),
@@ -1777,7 +1959,10 @@ Tensor addmm(
                 static_cast<long long>(bias.numel()),
         force_context_roundtrip ? 1 : 0,
         force_reason,
-        role_hint);
+        role_hint,
+        addmm_roundtrip_mode_name(requested_roundtrip_mode),
+        addmm_roundtrip_mode_name(effective_roundtrip_mode),
+        roundtrip_compare_on ? 1 : 0);
         std::fflush(stderr);
         if (target_callsite_192x2048_2048x512) {
             std::fprintf(
@@ -1786,16 +1971,56 @@ Tensor addmm(
             std::fflush(stderr);
         }
     }
-    if (force_context_roundtrip) {
-    context_weight = weight.cpu().contiguous().vulkan();
-    context_bias = bias.cpu().contiguous().vulkan();
-        if (addmm_trace_enabled()) {
-            std::fprintf(
-                    stderr,
-                    "[vk_addmm_trace] event=addmm_after_context_roundtrip\n");
-            std::fflush(stderr);
+    switch (effective_roundtrip_mode) {
+        case AddmmRoundtripMode::Off:
+            break;
+        case AddmmRoundtripMode::SyncOnly: {
+            addmm_force_sync_boundary();
+            if (addmm_trace_enabled()) {
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_after_context_sync_only\n");
+                std::fflush(stderr);
+            }
+            break;
         }
-  }
+        case AddmmRoundtripMode::CloneOnly: {
+            const Tensor weight_on_vulkan =
+                    weight.is_vulkan() ? weight : weight.vulkan();
+            const Tensor bias_on_vulkan = bias.is_vulkan() ? bias : bias.vulkan();
+            context_weight = weight_on_vulkan.clone();
+            context_bias = bias_on_vulkan.clone();
+            if (addmm_trace_enabled()) {
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_after_context_clone_only\n");
+                std::fflush(stderr);
+            }
+            break;
+        }
+        case AddmmRoundtripMode::Full:
+        case AddmmRoundtripMode::Auto: {
+            context_weight = weight.cpu().contiguous().vulkan();
+            context_bias = bias.cpu().contiguous().vulkan();
+            if (roundtrip_compare_on) {
+                addmm_log_roundtrip_compare_for_tensor(
+                        "weight",
+                        weight,
+                        context_weight);
+                addmm_log_roundtrip_compare_for_tensor(
+                        "bias",
+                        bias,
+                        context_bias);
+            }
+            if (addmm_trace_enabled()) {
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_after_context_roundtrip\n");
+                std::fflush(stderr);
+            }
+            break;
+        }
+    }
 
     if (target_callsite_192x2048_2048x512 &&
             env_true("PYTORCH_VULKAN_ADDMM_TARGET_PRELAUNCH_ZERO")) {
