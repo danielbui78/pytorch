@@ -393,6 +393,7 @@ enum class AddmmRoundtripMode {
     Off,
     SubmitOnly,
     FlushOnly,
+    SubmitFlush,
     SyncOnly,
     CloneOnly,
     Full,
@@ -420,6 +421,10 @@ inline AddmmRoundtripMode addmm_roundtrip_mode() {
         return AddmmRoundtripMode::FlushOnly;
     }
 
+    if (std::strcmp(env, "submit_flush") == 0) {
+        return AddmmRoundtripMode::SubmitFlush;
+    }
+
     if (std::strcmp(env, "clone_only") == 0) {
         return AddmmRoundtripMode::CloneOnly;
     }
@@ -443,6 +448,8 @@ inline const char* addmm_roundtrip_mode_name(const AddmmRoundtripMode mode) {
             return "submit_only";
         case AddmmRoundtripMode::FlushOnly:
             return "flush_only";
+        case AddmmRoundtripMode::SubmitFlush:
+            return "submit_flush";
         case AddmmRoundtripMode::SyncOnly:
             return "sync_only";
         case AddmmRoundtripMode::CloneOnly:
@@ -2024,6 +2031,16 @@ Tensor addmm(
                 std::fprintf(
                         stderr,
                         "[vk_addmm_trace] event=addmm_after_context_flush_only\n");
+                std::fflush(stderr);
+            }
+            break;
+        }
+        case AddmmRoundtripMode::SubmitFlush: {
+            addmm_force_sync_boundary();
+            if (addmm_trace_enabled()) {
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_after_context_submit_flush\n");
                 std::fflush(stderr);
             }
             break;
