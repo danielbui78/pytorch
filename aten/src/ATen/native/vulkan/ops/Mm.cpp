@@ -391,6 +391,8 @@ inline bool addmm_roundtrip_compare_enabled() {
 enum class AddmmRoundtripMode {
     Auto,
     Off,
+    SubmitOnly,
+    FlushOnly,
     SyncOnly,
     CloneOnly,
     Full,
@@ -408,6 +410,14 @@ inline AddmmRoundtripMode addmm_roundtrip_mode() {
 
     if (std::strcmp(env, "sync_only") == 0) {
         return AddmmRoundtripMode::SyncOnly;
+    }
+
+    if (std::strcmp(env, "submit_only") == 0) {
+        return AddmmRoundtripMode::SubmitOnly;
+    }
+
+    if (std::strcmp(env, "flush_only") == 0) {
+        return AddmmRoundtripMode::FlushOnly;
     }
 
     if (std::strcmp(env, "clone_only") == 0) {
@@ -429,6 +439,10 @@ inline const char* addmm_roundtrip_mode_name(const AddmmRoundtripMode mode) {
             return "auto";
         case AddmmRoundtripMode::Off:
             return "off";
+        case AddmmRoundtripMode::SubmitOnly:
+            return "submit_only";
+        case AddmmRoundtripMode::FlushOnly:
+            return "flush_only";
         case AddmmRoundtripMode::SyncOnly:
             return "sync_only";
         case AddmmRoundtripMode::CloneOnly:
@@ -447,6 +461,26 @@ inline void addmm_force_sync_boundary() {
 
     std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
     context->submit_cmd_to_gpu(VK_NULL_HANDLE);
+    context->flush();
+}
+
+inline void addmm_submit_only_boundary() {
+    api::Context* const context = api::context();
+    if (context == nullptr) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
+    context->submit_cmd_to_gpu(VK_NULL_HANDLE);
+}
+
+inline void addmm_flush_only_boundary() {
+    api::Context* const context = api::context();
+    if (context == nullptr) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> context_lock(context->dispatch_lock());
     context->flush();
 }
 
@@ -1974,6 +2008,26 @@ Tensor addmm(
     switch (effective_roundtrip_mode) {
         case AddmmRoundtripMode::Off:
             break;
+        case AddmmRoundtripMode::SubmitOnly: {
+            addmm_submit_only_boundary();
+            if (addmm_trace_enabled()) {
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_after_context_submit_only\n");
+                std::fflush(stderr);
+            }
+            break;
+        }
+        case AddmmRoundtripMode::FlushOnly: {
+            addmm_flush_only_boundary();
+            if (addmm_trace_enabled()) {
+                std::fprintf(
+                        stderr,
+                        "[vk_addmm_trace] event=addmm_after_context_flush_only\n");
+                std::fflush(stderr);
+            }
+            break;
+        }
         case AddmmRoundtripMode::SyncOnly: {
             addmm_force_sync_boundary();
             if (addmm_trace_enabled()) {
