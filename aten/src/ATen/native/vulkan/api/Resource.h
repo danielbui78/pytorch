@@ -495,6 +495,10 @@ class MemoryAllocator final {
     vmaCalculateStatistics(allocator_, &stats);
     return stats;
   }
+
+  inline VmaAllocator vma_allocator() const {
+    return allocator_;
+  }
 };
 
 class VulkanFence final {

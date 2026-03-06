@@ -2,6 +2,7 @@
 #include <ATen/native/vulkan/api/Context.h>
 #include <ATen/native/vulkan/api/Resource.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstdio>
 
@@ -18,6 +19,32 @@ bool alloc_diagnostics_enabled() {
   }
   return false;
 }
+
+bool alloc_budget_diagnostics_enabled() {
+  const char* env = std::getenv("TORCH_VULKAN_ALLOC_BUDGET_DIAGNOSTICS");
+  if (!env || env[0] == '\0') {
+    return false;
+  }
+  if (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' ||
+      env[0] == 'Y') {
+    return true;
+  }
+  return false;
+}
+
+struct BudgetSummary final {
+  uint64_t device_local_budget = 0ull;
+  uint64_t device_local_usage = 0ull;
+  uint64_t device_local_headroom = 0ull;
+  uint64_t dedicated_budget = 0ull;
+  uint64_t dedicated_usage = 0ull;
+  uint64_t dedicated_headroom = 0ull;
+  uint64_t host_budget = 0ull;
+  uint64_t host_usage = 0ull;
+  uint64_t host_headroom = 0ull;
+};
+
+std::atomic<uint64_t> image_budget_sequence{0u};
 
 bool has_device_local_host_visible(VmaAllocator allocator) {
   const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
@@ -105,6 +132,78 @@ bool heap_has_host_visible_type(
     }
   }
   return false;
+}
+
+BudgetSummary summarize_allocator_budgets(VmaAllocator allocator) {
+  BudgetSummary summary{};
+  const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
+  vmaGetMemoryProperties(allocator, &mem_props);
+
+  VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+  vmaGetHeapBudgets(allocator, budgets);
+
+  for (uint32_t heap_idx = 0; heap_idx < mem_props->memoryHeapCount; ++heap_idx) {
+    const VkMemoryHeap& heap = mem_props->memoryHeaps[heap_idx];
+    const uint64_t budget = static_cast<uint64_t>(budgets[heap_idx].budget);
+    const uint64_t usage = static_cast<uint64_t>(budgets[heap_idx].usage);
+    const uint64_t heap_size = static_cast<uint64_t>(heap.size);
+    const uint64_t effective_budget = budget > 0ull ? budget : heap_size;
+    const uint64_t headroom =
+        usage < effective_budget ? (effective_budget - usage) : 0ull;
+
+    if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u) {
+      summary.device_local_budget += effective_budget;
+      summary.device_local_usage += usage;
+      summary.device_local_headroom += headroom;
+      if (!heap_has_host_visible_type(mem_props, heap_idx)) {
+        summary.dedicated_budget += effective_budget;
+        summary.dedicated_usage += usage;
+        summary.dedicated_headroom += headroom;
+      }
+    } else {
+      summary.host_budget += effective_budget;
+      summary.host_usage += usage;
+      summary.host_headroom += headroom;
+    }
+  }
+
+  return summary;
+}
+
+void log_budget_snapshot(
+    const char* site,
+    VmaAllocator allocator,
+    const uint64_t sequence,
+    const uint64_t request_bytes,
+    const VkResult result,
+    const VkExtent3D& extents) {
+  if (!alloc_budget_diagnostics_enabled()) {
+    return;
+  }
+
+  const BudgetSummary summary = summarize_allocator_budgets(allocator);
+  std::fprintf(
+      stderr,
+      "[vulkan_budget] seq=%llu site=%s request=%llu result=%d extent=%ux%ux%u "
+      "device_local_budget=%llu device_local_usage=%llu device_local_headroom=%llu "
+      "dedicated_budget=%llu dedicated_usage=%llu dedicated_headroom=%llu "
+      "host_budget=%llu host_usage=%llu host_headroom=%llu\n",
+      static_cast<unsigned long long>(sequence),
+      site,
+      static_cast<unsigned long long>(request_bytes),
+      static_cast<int>(result),
+      static_cast<unsigned int>(extents.width),
+      static_cast<unsigned int>(extents.height),
+      static_cast<unsigned int>(extents.depth),
+      static_cast<unsigned long long>(summary.device_local_budget),
+      static_cast<unsigned long long>(summary.device_local_usage),
+      static_cast<unsigned long long>(summary.device_local_headroom),
+      static_cast<unsigned long long>(summary.dedicated_budget),
+      static_cast<unsigned long long>(summary.dedicated_usage),
+      static_cast<unsigned long long>(summary.dedicated_headroom),
+      static_cast<unsigned long long>(summary.host_budget),
+      static_cast<unsigned long long>(summary.host_usage),
+      static_cast<unsigned long long>(summary.host_headroom));
 }
 
 uint64_t dedicated_device_local_headroom_bytes(VmaAllocator allocator) {
@@ -650,8 +749,20 @@ VulkanImage::VulkanImage(
         image_properties_.image_extents.width) *
         static_cast<uint64_t>(image_properties_.image_extents.height) *
         static_cast<uint64_t>(image_properties_.image_extents.depth) * 4ull;
+    const uint64_t image_budget_seq = alloc_budget_diagnostics_enabled()
+        ? image_budget_sequence.fetch_add(1u, std::memory_order_relaxed) + 1u
+        : 0u;
     maybe_pressure_flush_before_alloc(
       allocator_, allocation_create_info, request_bytes);
+    if (image_budget_seq > 0u) {
+      log_budget_snapshot(
+          "image_prealloc",
+          allocator_,
+          image_budget_seq,
+          request_bytes,
+          VK_SUCCESS,
+          image_properties_.image_extents);
+    }
 
     VkResult alloc_result = vmaCreateImage(
         allocator_,
@@ -671,6 +782,15 @@ VulkanImage::VulkanImage(
             &(memory_.allocation),
             nullptr);
       }
+    }
+    if (image_budget_seq > 0u && alloc_result != VK_SUCCESS) {
+      log_budget_snapshot(
+          "image_result",
+          allocator_,
+          image_budget_seq,
+          request_bytes,
+          alloc_result,
+          image_properties_.image_extents);
     }
     VK_CHECK(alloc_result);
     // Only create the image view if the image has been bound to memory

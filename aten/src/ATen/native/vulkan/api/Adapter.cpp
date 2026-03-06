@@ -1,6 +1,8 @@
 #include <ATen/native/vulkan/api/Adapter.h>
 
+#include <atomic>
 #include <bitset>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -12,6 +14,122 @@ namespace at {
 namespace native {
 namespace vulkan {
 namespace api {
+
+namespace {
+
+bool alloc_budget_diagnostics_enabled() {
+  const char* env = std::getenv("TORCH_VULKAN_ALLOC_BUDGET_DIAGNOSTICS");
+  if (!env || env[0] == '\0') {
+    return false;
+  }
+  if (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' ||
+      env[0] == 'Y') {
+    return true;
+  }
+  return false;
+}
+
+bool heap_has_host_visible_type(
+    const VkPhysicalDeviceMemoryProperties* mem_props,
+    const uint32_t heap_idx) {
+  for (uint32_t type_idx = 0; type_idx < mem_props->memoryTypeCount; ++type_idx) {
+    const VkMemoryType& type = mem_props->memoryTypes[type_idx];
+    if (type.heapIndex != heap_idx) {
+      continue;
+    }
+    if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u) {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct BudgetSummary final {
+  uint64_t device_local_budget = 0ull;
+  uint64_t device_local_usage = 0ull;
+  uint64_t device_local_headroom = 0ull;
+  uint64_t dedicated_budget = 0ull;
+  uint64_t dedicated_usage = 0ull;
+  uint64_t dedicated_headroom = 0ull;
+  uint64_t host_budget = 0ull;
+  uint64_t host_usage = 0ull;
+  uint64_t host_headroom = 0ull;
+};
+
+std::atomic<uint64_t> submit_budget_sequence{0u};
+
+BudgetSummary summarize_allocator_budgets(VmaAllocator allocator) {
+  BudgetSummary summary{};
+  const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
+  vmaGetMemoryProperties(allocator, &mem_props);
+
+  VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+  vmaGetHeapBudgets(allocator, budgets);
+
+  for (uint32_t heap_idx = 0; heap_idx < mem_props->memoryHeapCount; ++heap_idx) {
+    const VkMemoryHeap& heap = mem_props->memoryHeaps[heap_idx];
+    const uint64_t budget = static_cast<uint64_t>(budgets[heap_idx].budget);
+    const uint64_t usage = static_cast<uint64_t>(budgets[heap_idx].usage);
+    const uint64_t heap_size = static_cast<uint64_t>(heap.size);
+    const uint64_t effective_budget = budget > 0ull ? budget : heap_size;
+    const uint64_t headroom =
+        usage < effective_budget ? (effective_budget - usage) : 0ull;
+
+    if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u) {
+      summary.device_local_budget += effective_budget;
+      summary.device_local_usage += usage;
+      summary.device_local_headroom += headroom;
+      if (!heap_has_host_visible_type(mem_props, heap_idx)) {
+        summary.dedicated_budget += effective_budget;
+        summary.dedicated_usage += usage;
+        summary.dedicated_headroom += headroom;
+      }
+    } else {
+      summary.host_budget += effective_budget;
+      summary.host_usage += usage;
+      summary.host_headroom += headroom;
+    }
+  }
+
+  return summary;
+}
+
+void log_submit_budget_snapshot(
+    const char* site,
+    VmaAllocator allocator,
+    const uint64_t sequence,
+    const Adapter::Queue& device_queue,
+    const uint32_t command_buffer_count,
+    const VkResult result) {
+  if (!alloc_budget_diagnostics_enabled()) {
+    return;
+  }
+
+  const BudgetSummary summary = summarize_allocator_budgets(allocator);
+  std::fprintf(
+      stderr,
+      "[vulkan_budget] seq=%llu site=%s queue_family=%u queue_index=%u "
+      "cmd_count=%u result=%d device_local_budget=%llu device_local_usage=%llu "
+      "device_local_headroom=%llu dedicated_budget=%llu dedicated_usage=%llu "
+      "dedicated_headroom=%llu host_budget=%llu host_usage=%llu host_headroom=%llu\n",
+      static_cast<unsigned long long>(sequence),
+      site,
+      static_cast<unsigned int>(device_queue.family_index),
+      static_cast<unsigned int>(device_queue.queue_index),
+      static_cast<unsigned int>(command_buffer_count),
+      static_cast<int>(result),
+      static_cast<unsigned long long>(summary.device_local_budget),
+      static_cast<unsigned long long>(summary.device_local_usage),
+      static_cast<unsigned long long>(summary.device_local_headroom),
+      static_cast<unsigned long long>(summary.dedicated_budget),
+      static_cast<unsigned long long>(summary.dedicated_usage),
+      static_cast<unsigned long long>(summary.dedicated_headroom),
+      static_cast<unsigned long long>(summary.host_budget),
+      static_cast<unsigned long long>(summary.host_usage),
+      static_cast<unsigned long long>(summary.host_headroom));
+}
+
+} // namespace
 
 PhysicalDevice::PhysicalDevice(VkPhysicalDevice physical_device_handle)
     : handle(physical_device_handle),
@@ -402,7 +520,31 @@ void Adapter::submit_cmd(
   std::lock_guard<std::mutex> queue_lock(
       queue_mutexes_[device_queue.queue_index % NUM_QUEUE_MUTEXES]);
 
-  VK_CHECK(vkQueueSubmit(device_queue.handle, 1u, &submit_info, fence));
+  const uint64_t submit_budget_seq = alloc_budget_diagnostics_enabled()
+      ? submit_budget_sequence.fetch_add(1u, std::memory_order_relaxed) + 1u
+      : 0u;
+  if (submit_budget_seq > 0u) {
+    log_submit_budget_snapshot(
+        "submit_pre",
+        vma_.vma_allocator(),
+        submit_budget_seq,
+        device_queue,
+        1u,
+        VK_SUCCESS);
+  }
+
+  const VkResult submit_result =
+      vkQueueSubmit(device_queue.handle, 1u, &submit_info, fence);
+  if (submit_budget_seq > 0u && submit_result != VK_SUCCESS) {
+    log_submit_budget_snapshot(
+        "submit_result",
+        vma_.vma_allocator(),
+        submit_budget_seq,
+        device_queue,
+        1u,
+        submit_result);
+  }
+  VK_CHECK(submit_result);
 }
 
 void Adapter::submit_cmds(
@@ -421,7 +563,31 @@ void Adapter::submit_cmds(
       nullptr, // pSignalSemaphores
   };
 
-  VK_CHECK(vkQueueSubmit(device_queue.handle, 1u, &submit_info, fence));
+  const uint64_t submit_budget_seq = alloc_budget_diagnostics_enabled()
+      ? submit_budget_sequence.fetch_add(1u, std::memory_order_relaxed) + 1u
+      : 0u;
+  if (submit_budget_seq > 0u) {
+    log_submit_budget_snapshot(
+        "submit_pre",
+        vma_.vma_allocator(),
+        submit_budget_seq,
+        device_queue,
+        utils::safe_downcast<uint32_t>(cmds.size()),
+        VK_SUCCESS);
+  }
+
+  const VkResult submit_result =
+      vkQueueSubmit(device_queue.handle, 1u, &submit_info, fence);
+  if (submit_budget_seq > 0u && submit_result != VK_SUCCESS) {
+    log_submit_budget_snapshot(
+        "submit_result",
+        vma_.vma_allocator(),
+        submit_budget_seq,
+        device_queue,
+        utils::safe_downcast<uint32_t>(cmds.size()),
+        submit_result);
+  }
+  VK_CHECK(submit_result);
 }
 
 std::string Adapter::stringize() const {
