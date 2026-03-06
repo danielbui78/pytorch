@@ -16,6 +16,7 @@
 #include <limits>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <torch/library.h>
 
 namespace at {
@@ -26,6 +27,51 @@ namespace ops {
 using namespace api::utils;
 
 namespace {
+
+enum class AddTensorInplaceMode {
+  Wrapper,
+  Direct,
+};
+
+inline AddTensorInplaceMode add_tensor_inplace_mode() {
+  static const AddTensorInplaceMode mode = []() {
+    const char* env = std::getenv("PYTORCH_VULKAN_ADD_TENSOR_INPLACE_MODE");
+    if (env == nullptr || env[0] == '\0') {
+      return AddTensorInplaceMode::Wrapper;
+    }
+
+    std::string value(env);
+    for (char& ch : value) {
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+
+    if (
+        value == "wrapper" || value == "legacy" || value == "default" ||
+        value == "auto") {
+      return AddTensorInplaceMode::Wrapper;
+    }
+    if (value == "direct") {
+      return AddTensorInplaceMode::Direct;
+    }
+
+    TORCH_CHECK(
+        false,
+        "PYTORCH_VULKAN_ADD_TENSOR_INPLACE_MODE must be one of: "
+        "wrapper, direct");
+  }();
+  return mode;
+}
+
+inline const char* add_tensor_inplace_mode_name(
+    const AddTensorInplaceMode mode) {
+  switch (mode) {
+    case AddTensorInplaceMode::Wrapper:
+      return "wrapper";
+    case AddTensorInplaceMode::Direct:
+      return "direct";
+  }
+  return "unknown";
+}
 
 inline bool fp16_buffer_storage_enabled() {
   return api::context()->fp16_buffer_storage_enabled();
@@ -1086,19 +1132,31 @@ static Tensor& add_tensor_(
     const Tensor& other_arg,
     const Scalar& alpha) {
   if (self.is_vulkan()) {
+    const AddTensorInplaceMode inplace_mode = add_tensor_inplace_mode();
     const int64_t trace_id =
         binaryop_trace_enabled() ? next_binaryop_trace_id() : -1;
     if (trace_id > 0 && trace_id <= binaryop_trace_limit()) {
       const vTensor& v_self = convert(self);
       std::cerr << "[vk_binaryop_trace] id=" << trace_id
                 << " site=add_tensor_.entry alpha=" << alpha.to<float>()
+                << " inplace_mode="
+                << add_tensor_inplace_mode_name(inplace_mode)
                 << " self_storage=" << storage_type_name(v_self.storage_type())
                 << " self_dtype=" << static_cast<int>(v_self.dtype())
                 << " self_numel=" << self.numel()
                 << " other_is_vulkan=" << other_arg.is_vulkan() << "\n";
     }
-    // Avoid unstable Vulkan in-place binary kernels: run out-of-place then copy
-    // back into self.
+    if (inplace_mode == AddTensorInplaceMode::Direct) {
+      return binary_op_tensor_(
+          self,
+          other_arg,
+          std::optional<Scalar>(alpha),
+          VK_KERNEL(add_inplace),
+          VK_KERNEL(add_buffer_inplace),
+          VK_KERNEL(add_buffer_f16_inplace));
+    }
+    // Preserve the historical wrapper path by default; the direct path is
+    // env-gated for add_.Tensor revalidation.
     UpdateGuardArm guard_scope{};
     Tensor out = add_tensor(self, other_arg, alpha);
     const bool force_cpu_copy = consume_update_guard_force_cpu_copy_next();
