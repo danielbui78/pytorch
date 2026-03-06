@@ -37,7 +37,7 @@ inline AddTensorInplaceMode add_tensor_inplace_mode() {
   static const AddTensorInplaceMode mode = []() {
     const char* env = std::getenv("PYTORCH_VULKAN_ADD_TENSOR_INPLACE_MODE");
     if (env == nullptr || env[0] == '\0') {
-      return AddTensorInplaceMode::Wrapper;
+      return AddTensorInplaceMode::Direct;
     }
 
     std::string value(env);
@@ -46,11 +46,10 @@ inline AddTensorInplaceMode add_tensor_inplace_mode() {
     }
 
     if (
-        value == "wrapper" || value == "legacy" || value == "default" ||
-        value == "auto") {
+        value == "wrapper" || value == "legacy") {
       return AddTensorInplaceMode::Wrapper;
     }
-    if (value == "direct") {
+    if (value == "direct" || value == "default" || value == "auto") {
       return AddTensorInplaceMode::Direct;
     }
 
