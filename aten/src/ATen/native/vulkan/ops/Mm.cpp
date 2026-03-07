@@ -1710,14 +1710,17 @@ Tensor run_addmm_context(
     std::fflush(stderr);
   }
 
-  vTensor v_output{
-      context,
-      {
-          input_arg_2d.sizes()[Layout::Parameter::height],
-          unpacked_weight_sizes[Layout::Parameter::width],
-      },
-      v_input.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::LinearOutput);
+    return vTensor{
+        context,
+        {
+            input_arg_2d.sizes()[Layout::Parameter::height],
+            unpacked_weight_sizes[Layout::Parameter::width],
+        },
+        v_input.dtype(),
+    };
+  }();
 
   api::UniformParamsBuffer params;
   api::ShaderInfo compute_shader;
@@ -1786,7 +1789,10 @@ Tensor run_addmm_context(
                 static_cast<long long>(trace_id));
         std::fflush(stderr);
     }
-  Tensor output = convert(v_output);
+  Tensor output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::CopyTemp);
+    return convert(v_output);
+  }();
 
     if (trace_on) {
         std::fprintf(
