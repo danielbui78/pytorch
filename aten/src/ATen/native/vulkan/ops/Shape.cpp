@@ -17,6 +17,7 @@ static Tensor view_internal(const Tensor& self_arg, const IntArrayRef shape) {
   at::DimVector inferred_size = at::infer_size_dv(shape, self.numel());
   IntArrayRef output_size(inferred_size);
 
+  api::AllocationTagScope tag_scope(api::AllocationTag::ViewOutput);
   vTensor v_output{
       context,
       output_size.vec(),

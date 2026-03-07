@@ -21,6 +21,7 @@ Tensor clone(
       "Vulkan supports Preserve and Contiguous memory formats");
 
   Tensor self;
+  api::AllocationTagScope tag_scope(api::AllocationTag::LayoutOutput);
   if (memory_format == MemoryFormat::Preserve) {
     if (src.is_non_overlapping_and_dense()) {
       // Copy all strides, this is marginally faster than calling empty_like

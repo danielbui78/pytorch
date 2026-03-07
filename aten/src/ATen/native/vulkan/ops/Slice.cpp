@@ -277,6 +277,7 @@ Tensor slice(
   dim += 4 - nDims;
 
   IntArrayRef output_sizes(newSizes);
+  api::AllocationTagScope tag_scope(api::AllocationTag::IndexingOutput);
   vTensor v_output{
       api::context(), output_sizes.vec(), convert_dtype(self.scalar_type())};
 

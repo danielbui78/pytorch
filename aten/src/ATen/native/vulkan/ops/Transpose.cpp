@@ -122,6 +122,7 @@ Tensor transpose(const Tensor& self, int64_t index0, int64_t index1) {
   newSizes[new_index1] = oldSizes[new_index0];
 
   IntArrayRef output_size(newSizes);
+  api::AllocationTagScope tag_scope(api::AllocationTag::LayoutOutput);
   vTensor v_output{
       api::context(),
       output_size.vec(),

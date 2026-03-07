@@ -394,6 +394,8 @@ Tensor select(const Tensor& self, int64_t dim, int64_t index) {
       self.dim() == 3 || self.dim() == 4,
       "Vulkan select only supports 3d and 4d tensors!");
 
+  api::AllocationTagScope tag_scope(api::AllocationTag::IndexingOutput);
+
   const int64_t size = self.size(dim);
 
   if (index < -size || index >= size) {

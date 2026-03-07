@@ -41,6 +41,7 @@ Tensor unsqueeze(const at::Tensor& self, int64_t dim) {
   }
   output_size.insert(output_size.begin() + dim, 1);
   // Create the output texture
+  api::AllocationTagScope tag_scope(api::AllocationTag::LayoutOutput);
   vTensor v_output{
       context,
       output_size,

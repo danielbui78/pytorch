@@ -39,6 +39,12 @@ enum class AllocationTag : uint8_t {
   LinearPackInput,
   LinearPackWeight,
   BinaryOutput,
+  LayerNormBinary,
+  LinearEpilogueBinary,
+  FactoryOutput,
+  ViewOutput,
+  IndexingOutput,
+  LayoutOutput,
   UnaryOutput,
   ReductionOutput,
   SoftmaxOutput,
@@ -49,6 +55,7 @@ enum class AllocationTag : uint8_t {
 };
 
 const char* allocation_tag_name(AllocationTag tag);
+AllocationTag current_allocation_tag();
 
 class AllocationTagScope final {
  public:

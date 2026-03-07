@@ -87,6 +87,7 @@ std::tuple<Tensor, Tensor, Tensor> native_layer_norm(
 
   // in order to avoid recomputation of mean, we manually compute var as below
   // instead of invoking the var operator.
+  api::AllocationTagScope binary_scope(api::AllocationTag::LayerNormBinary);
   auto input_minus_mean = input.sub(mean);
   auto var = input_minus_mean.mul(input_minus_mean)
                  .mean(dims_to_reduce_ref, var_keep_dim);

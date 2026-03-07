@@ -84,6 +84,19 @@ bool needs_buffer_storage(const IntArrayRef sizes) {
       extents.depth > u32_max;
 }
 
+inline bool use_generic_factory_output_tag() {
+  return api::current_allocation_tag() == api::AllocationTag::Unknown;
+}
+
+template <typename Factory>
+auto make_factory_tensor(Factory&& factory) {
+  if (use_generic_factory_output_tag()) {
+    api::AllocationTagScope tag_scope(api::AllocationTag::FactoryOutput);
+    return factory();
+  }
+  return factory();
+}
+
 } // namespace
 
 Tensor _empty_affine_quantized(
@@ -100,15 +113,17 @@ Tensor _empty_affine_quantized(
       : api::StorageType::TEXTURE_3D;
       const c10::MemoryFormat resolved_format =
         memory_format.value_or(c10::MemoryFormat::Contiguous);
-  return convert_quantized(vTensor{
-      api::context(),
-      sizes.vec(),
-      scale,
-      zero_point,
-      convert_dtype(dtype ? *dtype : c10::kFloat),
-      storage_type,
+  return convert_quantized(make_factory_tensor([&]() {
+    return vTensor{
+        api::context(),
+        sizes.vec(),
+        scale,
+        zero_point,
+        convert_dtype(dtype ? *dtype : c10::kFloat),
+        storage_type,
         get_gpu_memory_layout(storage_type, resolved_format),
-  });
+    };
+  }));
 }
 
 static Tensor empty_memory_format(
@@ -123,13 +138,15 @@ static Tensor empty_memory_format(
       : api::StorageType::TEXTURE_3D;
       const c10::MemoryFormat resolved_format =
         memory_format.value_or(c10::MemoryFormat::Contiguous);
-  return convert(vTensor{
-      api::context(),
-      sizes.vec(),
-      convert_dtype(dtype ? *dtype : c10::kFloat),
-      storage_type,
+  return convert(make_factory_tensor([&]() {
+    return vTensor{
+        api::context(),
+        sizes.vec(),
+        convert_dtype(dtype ? *dtype : c10::kFloat),
+        storage_type,
         get_gpu_memory_layout(storage_type, resolved_format),
-  });
+    };
+  }));
 }
 
 static Tensor empty_strided(

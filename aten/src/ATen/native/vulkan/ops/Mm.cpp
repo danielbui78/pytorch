@@ -1813,12 +1813,24 @@ Tensor run_addmm_context(
         std::fflush(stderr);
     }
     if (arith_mode == AddmmOutputArithmeticMode::Default) {
-        api::AllocationTagScope bias_scope(api::AllocationTag::BiasTemp);
-        output = output.mul(alpha).add(convert(packed_v_bias).mul(beta));
+        api::AllocationTagScope epilogue_scope(
+                api::AllocationTag::LinearEpilogueBinary);
+        Tensor scaled_bias = [&]() {
+            api::AllocationTagScope bias_scope(api::AllocationTag::BiasTemp);
+            return convert(packed_v_bias).mul(beta);
+        }();
+        output = output.mul(alpha).add(scaled_bias);
     } else if (arith_mode == AddmmOutputArithmeticMode::SkipOutputMul) {
-        api::AllocationTagScope bias_scope(api::AllocationTag::BiasTemp);
-        output = output.add(convert(packed_v_bias).mul(beta));
+        api::AllocationTagScope epilogue_scope(
+                api::AllocationTag::LinearEpilogueBinary);
+        Tensor scaled_bias = [&]() {
+            api::AllocationTagScope bias_scope(api::AllocationTag::BiasTemp);
+            return convert(packed_v_bias).mul(beta);
+        }();
+        output = output.add(scaled_bias);
     } else if (arith_mode == AddmmOutputArithmeticMode::SkipBiasAdd) {
+        api::AllocationTagScope epilogue_scope(
+                api::AllocationTag::LinearEpilogueBinary);
         output = output.mul(alpha);
     }
 
@@ -1955,7 +1967,13 @@ Tensor run_baddbmm_context(
   auto mm_output = mm_output_unpacked.slice(
       Layout::BatchMatrices::batch, 0, input_batch * step, step);
 
-  return mm_output.mul(alpha).add(convert(packed_v_bias).mul(beta));
+  api::AllocationTagScope epilogue_scope(
+      api::AllocationTag::LinearEpilogueBinary);
+  Tensor scaled_bias = [&]() {
+    api::AllocationTagScope bias_scope(api::AllocationTag::BiasTemp);
+    return convert(packed_v_bias).mul(beta);
+  }();
+  return mm_output.mul(alpha).add(scaled_bias);
 }
 
 Tensor addmm(

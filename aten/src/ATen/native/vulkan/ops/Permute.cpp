@@ -103,6 +103,7 @@ Tensor permute(const Tensor& self, IntArrayRef dims) {
   }
 
   IntArrayRef output_sizes(newSizes);
+  api::AllocationTagScope tag_scope(api::AllocationTag::LayoutOutput);
   vTensor v_output{
       api::context(),
       output_sizes.vec(),

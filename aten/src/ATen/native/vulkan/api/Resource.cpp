@@ -479,6 +479,18 @@ const char* allocation_tag_name(const AllocationTag tag) {
       return "linear_pack_weight";
     case AllocationTag::BinaryOutput:
       return "binary_output";
+    case AllocationTag::LayerNormBinary:
+      return "layer_norm_binary";
+    case AllocationTag::LinearEpilogueBinary:
+      return "linear_epilogue_binary";
+    case AllocationTag::FactoryOutput:
+      return "factory_output";
+    case AllocationTag::ViewOutput:
+      return "view_output";
+    case AllocationTag::IndexingOutput:
+      return "indexing_output";
+    case AllocationTag::LayoutOutput:
+      return "layout_output";
     case AllocationTag::UnaryOutput:
       return "unary_output";
     case AllocationTag::ReductionOutput:
@@ -495,6 +507,10 @@ const char* allocation_tag_name(const AllocationTag tag) {
       return "copy_temp";
   }
   return "unknown";
+}
+
+AllocationTag current_allocation_tag() {
+  return tls_allocation_tag;
 }
 
 AllocationTagScope::AllocationTagScope(const AllocationTag tag)
