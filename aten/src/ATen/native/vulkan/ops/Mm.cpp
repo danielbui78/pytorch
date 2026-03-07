@@ -25,6 +25,61 @@ namespace {
 using namespace api::utils;
 using namespace at::native::vulkan::ops;
 
+bool linearPathTraceEnabled() {
+  const char* const value = std::getenv("PYTORCH_VULKAN_LINEAR_PATH_TRACE");
+  if (nullptr == value) {
+    return false;
+  }
+
+  return
+      0 == std::strcmp(value, "1") ||
+      0 == std::strcmp(value, "true") ||
+      0 == std::strcmp(value, "TRUE") ||
+      0 == std::strcmp(value, "on") ||
+      0 == std::strcmp(value, "ON");
+}
+
+std::string formatSizes(const IntArrayRef sizes) {
+  std::string formatted = "[";
+  for (const auto i : c10::irange(sizes.size())) {
+    if (0 != i) {
+      formatted += ",";
+    }
+    formatted += std::to_string(sizes[i]);
+  }
+  formatted += "]";
+  return formatted;
+}
+
+void traceLinearMmEvent(
+    const char* const event,
+    const Tensor& input,
+    const std::optional<Tensor>& weight = std::nullopt,
+    const std::optional<Tensor>& bias = std::nullopt,
+    const IntArrayRef extra_sizes = {}) {
+  if (!linearPathTraceEnabled()) {
+    return;
+  }
+
+  const std::string input_sizes = formatSizes(input.sizes());
+  const std::string weight_sizes =
+      (weight.has_value() && weight->defined()) ? formatSizes(weight->sizes()) : "[]";
+  const std::string bias_sizes =
+      (bias.has_value() && bias->defined()) ? formatSizes(bias->sizes()) : "[]";
+  const std::string extra = formatSizes(extra_sizes);
+
+  std::fprintf(
+      stderr,
+      "[vk_linear_path] file=Mm event=%s input_sizes=%s weight_sizes=%s bias_sizes=%s extra_sizes=%s input_is_vulkan=%d\n",
+      event,
+      input_sizes.c_str(),
+      weight_sizes.c_str(),
+      bias_sizes.c_str(),
+      extra.c_str(),
+      input.is_vulkan() ? 1 : 0);
+  std::fflush(stderr);
+}
+
 inline void check_storage_buffer_limit(
     const vTensor& v_tensor,
     const char* name) {
@@ -1034,6 +1089,13 @@ Tensor run_quantized_addmm_context(
 
   const Tensor input_arg_2d =
       input_arg.dim() == 2 ? input_arg : reshape_to_2d(input_arg);
+  traceLinearMmEvent(
+      input_arg.dim() == 2 ? "run_addmm_context_no_local_reshape"
+                           : "run_addmm_context_after_local_reshape",
+      input_arg_2d,
+      linear_context->get_val(LinearPackedContext::Packed::Weight).toTensor(),
+      linear_context->get_val(LinearPackedContext::Packed::Bias).toTensor(),
+      input_arg.sizes());
   const Tensor input =
       input_arg_2d.is_vulkan() ? input_arg_2d : input_arg_2d.vulkan();
   const vTensor& v_input = convert(input);
@@ -1613,6 +1675,11 @@ Tensor run_addmm_context(
   }
 
   api::Context* const context = api::context();
+    traceLinearMmEvent(
+        "run_addmm_context_enter",
+        input_arg,
+        linear_context->get_val(LinearPackedContext::Packed::Weight).toTensor(),
+        linear_context->get_val(LinearPackedContext::Packed::Bias).toTensor());
     const bool trace_on = addmm_trace_enabled();
     const int64_t trace_id = trace_on ? next_addmm_trace_id() : 0;
 
@@ -1633,6 +1700,13 @@ Tensor run_addmm_context(
 
   const Tensor input_arg_2d =
       input_arg.dim() == 2 ? input_arg : reshape_to_2d(input_arg);
+  traceLinearMmEvent(
+      input_arg.dim() == 2 ? "run_addmm_context_no_local_reshape"
+                           : "run_addmm_context_after_local_reshape",
+      input_arg_2d,
+      linear_context->get_val(LinearPackedContext::Packed::Weight).toTensor(),
+      linear_context->get_val(LinearPackedContext::Packed::Bias).toTensor(),
+      input_arg.sizes());
   const Tensor input =
       input_arg_2d.is_vulkan() ? input_arg_2d : input_arg_2d.vulkan();
   const vTensor& v_input = pack_inputs_using_width_packing(input);
@@ -1982,6 +2056,7 @@ Tensor addmm(
     const Tensor& weight,
     const Scalar& beta,
     const Scalar& alpha) {
+    traceLinearMmEvent("addmm_api_enter", input, weight, bias);
     const float alpha_f = alpha.to<float>();
     const float beta_f = beta.to<float>();
 

@@ -33,6 +33,9 @@
 #endif
 
 #include <cctype>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <string>
 #include <utility>
@@ -47,9 +50,64 @@ static inline bool parseLinearFlatten3d() {
   return value.has_value() && value.value();
 }
 
+static bool vulkanLinearPathTraceEnabled() {
+  const char* const value = std::getenv("PYTORCH_VULKAN_LINEAR_PATH_TRACE");
+  if (nullptr == value) {
+    return false;
+  }
+
+  return
+      0 == std::strcmp(value, "1") ||
+      0 == std::strcmp(value, "true") ||
+      0 == std::strcmp(value, "TRUE") ||
+      0 == std::strcmp(value, "on") ||
+      0 == std::strcmp(value, "ON");
+}
+
+static std::string formatSizes(const IntArrayRef sizes) {
+  std::string formatted = "[";
+  for (const auto i : c10::irange(sizes.size())) {
+    if (0 != i) {
+      formatted += ",";
+    }
+    formatted += std::to_string(sizes[i]);
+  }
+  formatted += "]";
+  return formatted;
+}
+
+static void traceVulkanLinearPath(
+    const char* const event,
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor* const bias,
+    const IntArrayRef extra_sizes = {}) {
+  if (!vulkanLinearPathTraceEnabled() || !input.is_vulkan()) {
+    return;
+  }
+
+  const std::string input_sizes = formatSizes(input.sizes());
+  const std::string weight_sizes = formatSizes(weight.sizes());
+  const std::string bias_sizes =
+      (nullptr != bias && bias->defined()) ? formatSizes(bias->sizes()) : "[]";
+  const std::string extra = formatSizes(extra_sizes);
+
+  std::fprintf(
+      stderr,
+      "[vk_linear_path] file=Linear event=%s input_sizes=%s weight_sizes=%s bias_sizes=%s extra_sizes=%s input_contiguous=%d\n",
+      event,
+      input_sizes.c_str(),
+      weight_sizes.c_str(),
+      bias_sizes.c_str(),
+      extra.c_str(),
+      input.is_contiguous() ? 1 : 0);
+  std::fflush(stderr);
+}
+
 // `_flatten_nd_linear` flattens all but the last dimension of the input tensor
 // before passing it to linear operation
 static inline Tensor _flatten_nd_linear(const Tensor& input, const Tensor& weight, const Tensor& bias) {
+  traceVulkanLinearPath("flatten_nd_enter", input, weight, &bias);
   const auto input_sizes = input.sym_sizes();
 
   const auto result_flattened = [&]() -> Tensor {
@@ -61,10 +119,17 @@ static inline Tensor _flatten_nd_linear(const Tensor& input, const Tensor& weigh
         flattened_nrows *= size;
       }
       return flattened_nrows;
-    }();
+      }();
 
     const auto input_flattened = input.view_symint({input_flattened_nrows, input_ncols});
+    traceVulkanLinearPath(
+        "flatten_view_complete",
+        input_flattened,
+        weight,
+        &bias,
+        input.sizes());
     if (weight.layout() == c10::kStrided) {
+      traceVulkanLinearPath("flatten_addmm_dispatch", input_flattened, weight, &bias);
       return at::addmm(bias, input_flattened, weight.t());
     } else {
       // weight is sparse, and addmm for sparse expects matmul lhs to be sparse,
@@ -78,11 +143,20 @@ static inline Tensor _flatten_nd_linear(const Tensor& input, const Tensor& weigh
   // Unflatten flattened row dims
   auto result_sizes = c10::SymDimVector{input_sizes.begin(), input_sizes.end()};
   result_sizes.back() = result_flattened.sym_size(1);
+  traceVulkanLinearPath(
+      "flatten_result_unflatten",
+      result_flattened,
+      weight,
+      &bias,
+      IntArrayRef(input.sizes()));
   return result_flattened.view_symint(result_sizes);
 }
 
 
 Tensor linear(const Tensor& input, const Tensor& weight, const std::optional<Tensor>& bias_opt) {
+  const Tensor* const bias_ptr =
+      bias_opt.has_value() ? &bias_opt.value() : nullptr;
+  traceVulkanLinearPath("linear_enter", input, weight, bias_ptr);
   // _matmul_impl checks this again later, but _flatten_nd_linear does not work on scalars inputs,
   // so let's try to catch this here already
   const auto input_dim = input.dim();
@@ -122,10 +196,12 @@ Tensor linear(const Tensor& input, const Tensor& weight, const std::optional<Ten
     // Also hit the fused path for contiguous nD input, if not using xla
     // backend. Reshaping/flattening has some performance implications on xla.
     if (input.is_contiguous_or_false()) {
+      traceVulkanLinearPath("linear_choose_flatten_nd", input, weight, bias_ptr);
       return _flatten_nd_linear(input, weight, *bias);
     } else if (parseLinearFlatten3d()) {
       // If user forces flattening via env var
       const Tensor input_cont = input.contiguous();
+      traceVulkanLinearPath("linear_force_contiguous_then_flatten", input_cont, weight, bias_ptr);
       return _flatten_nd_linear(input_cont, weight, *bias);
     }
   }
