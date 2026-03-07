@@ -477,6 +477,14 @@ const char* allocation_tag_name(const AllocationTag tag) {
       return "linear_pack_input";
     case AllocationTag::LinearPackWeight:
       return "linear_pack_weight";
+    case AllocationTag::BinaryOutput:
+      return "binary_output";
+    case AllocationTag::UnaryOutput:
+      return "unary_output";
+    case AllocationTag::ReductionOutput:
+      return "reduction_output";
+    case AllocationTag::SoftmaxOutput:
+      return "softmax_output";
     case AllocationTag::BiasTemp:
       return "bias_temp";
     case AllocationTag::Staging:

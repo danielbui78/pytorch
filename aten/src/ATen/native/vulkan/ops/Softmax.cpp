@@ -111,11 +111,14 @@ Tensor softmax_internal(
   const Tensor input = input_arg.is_vulkan() ? input_arg : input_arg.vulkan();
   const vTensor& v_input = convert(input);
 
-  vTensor v_output{
-      context,
-      v_input.sizes(),
-      v_input.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::SoftmaxOutput);
+    return vTensor{
+        context,
+        v_input.sizes(),
+        v_input.dtype(),
+    };
+  }();
   const api::utils::uvec3 global_workgroup_extents = v_output.extents();
   api::utils::ivec4 input_shader_extents = {
       safe_downcast<int32_t>(v_input.extents().data[0u]),

@@ -492,11 +492,14 @@ static Tensor binary_op_scalar(
   const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
   const vTensor& v_self = convert(self);
 
-  vTensor v_output{
-      context,
-      v_self.sizes(),
-      v_self.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::BinaryOutput);
+    return vTensor{
+        context,
+        v_self.sizes(),
+        v_self.dtype(),
+    };
+  }();
 
   const float other_val = alpha_arg ? other.to<float>() * alpha_arg->to<float>()
                                     : other.to<float>();
@@ -670,13 +673,16 @@ static Tensor binary_op_tensor(
         buffer_dtype_supported(v_self),
         "Vulkan buffer binary op requires float32, or fp16 buffer storage to be enabled.");
 
-    vTensor v_output{
-        context,
-        utils::broadcast_size(self_arg, other_arg),
-        v_self.dtype(),
-        api::StorageType::BUFFER,
-        buffer_output_layout(v_self, v_other),
-    };
+    vTensor v_output = [&]() {
+      api::AllocationTagScope tag_scope(api::AllocationTag::BinaryOutput);
+      return vTensor{
+          context,
+          utils::broadcast_size(self_arg, other_arg),
+          v_self.dtype(),
+          api::StorageType::BUFFER,
+          buffer_output_layout(v_self, v_other),
+      };
+    }();
 
     check_storage_buffer_limit(v_self, "binary op input");
     check_storage_buffer_limit(v_other, "binary op other");
@@ -737,11 +743,14 @@ static Tensor binary_op_tensor(
               << " other_numel=" << other.numel() << "\n";
   }
 
-  vTensor v_output{
-      context,
-      utils::broadcast_size(self_arg, other_arg),
-      v_self.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::BinaryOutput);
+    return vTensor{
+        context,
+        utils::broadcast_size(self_arg, other_arg),
+        v_self.dtype(),
+    };
+  }();
 
   const double alpha = alpha_arg ? alpha_arg->to<double>() : 1.0;
   const struct Block final {
@@ -1510,11 +1519,14 @@ static Tensor eq_scalar(const Tensor& self_arg, const Scalar& other) {
   const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
   const vTensor& v_self = convert(self);
 
-  vTensor v_output{
-      context,
-      v_self.sizes(),
-      api::kBool,
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::BinaryOutput);
+    return vTensor{
+        context,
+        v_self.sizes(),
+        api::kBool,
+    };
+  }();
 
   const float other_val = other.to<float>();
   const struct Block final {
@@ -1566,11 +1578,14 @@ static Tensor eq_tensor(const Tensor& self_arg, const Tensor& other_arg) {
   const Tensor other = other_arg.is_vulkan() ? other_arg : other_arg.vulkan();
   const vTensor& v_other = convert(other);
 
-  vTensor v_output{
-      context,
-      utils::broadcast_size(self_arg, other_arg),
-      api::kBool,
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::BinaryOutput);
+    return vTensor{
+        context,
+        utils::broadcast_size(self_arg, other_arg),
+        api::kBool,
+    };
+  }();
 
   const struct Block final {
     uvec4 output_tensor_size;

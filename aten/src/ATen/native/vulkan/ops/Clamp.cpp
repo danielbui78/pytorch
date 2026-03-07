@@ -27,11 +27,14 @@ Tensor _clamp(
   const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
   const vTensor& v_self = convert(self_arg);
 
-  vTensor v_output{
-      context,
-      v_self.sizes(),
-      v_self.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::UnaryOutput);
+    return vTensor{
+        context,
+        v_self.sizes(),
+        v_self.dtype(),
+    };
+  }();
   if (v_self.is_quantized()) {
     v_output.set_is_quantized();
     v_output.set_scale(v_self.get_scale());
@@ -205,11 +208,14 @@ Tensor activation(
   const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
   const vTensor& v_self = convert(self);
 
-  vTensor v_output{
-      context,
-      v_self.sizes(),
-      v_self.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::UnaryOutput);
+    return vTensor{
+        context,
+        v_self.sizes(),
+        v_self.dtype(),
+    };
+  }();
 
   const struct Block final {
     uvec3 extents;
@@ -344,11 +350,14 @@ Tensor activation_scalar(
   const Tensor self = self_arg.is_vulkan() ? self_arg : self_arg.vulkan();
   const vTensor& v_self = convert(self);
 
-  vTensor v_output{
-      context,
-      v_self.sizes(),
-      v_self.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::UnaryOutput);
+    return vTensor{
+        context,
+        v_self.sizes(),
+        v_self.dtype(),
+    };
+  }();
 
   api::UniformParamsBuffer params;
 

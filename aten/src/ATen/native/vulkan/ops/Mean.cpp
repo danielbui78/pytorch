@@ -203,20 +203,26 @@ Tensor run_mean_buffer_reduction_two_pass(
   std::vector<int64_t> pass1_output_size = v_input.sizes();
   pass1_output_size.at(buffer_dim) = static_cast<int64_t>(block_count);
 
-  vTensor v_pass1{
-      context,
-      pass1_output_size,
-      api::kFloat,
-      api::StorageType::BUFFER,
-      v_input.gpu_memory_layout(),
-  };
-  vTensor v_output_buffer{
-      context,
-      full_output_size,
-      api::kFloat,
-      api::StorageType::BUFFER,
-      v_input.gpu_memory_layout(),
-  };
+  vTensor v_pass1 = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::ReductionOutput);
+    return vTensor{
+        context,
+        pass1_output_size,
+        api::kFloat,
+        api::StorageType::BUFFER,
+        v_input.gpu_memory_layout(),
+    };
+  }();
+  vTensor v_output_buffer = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::ReductionOutput);
+    return vTensor{
+        context,
+        full_output_size,
+        api::kFloat,
+        api::StorageType::BUFFER,
+        v_input.gpu_memory_layout(),
+    };
+  }();
 
   check_storage_buffer_limit(v_input, "mean input");
   check_storage_buffer_limit(v_pass1, "mean pass1 output");
@@ -290,13 +296,16 @@ Tensor run_mean_buffer_reduction(
     uint32_t axis,
     uint32_t dim_size,
     const api::ScalarType output_dtype) {
-  vTensor v_output_buffer{
-      context,
-      full_output_size,
-      output_dtype,
-      api::StorageType::BUFFER,
-      v_input.gpu_memory_layout(),
-  };
+  vTensor v_output_buffer = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::ReductionOutput);
+    return vTensor{
+        context,
+        full_output_size,
+        output_dtype,
+        api::StorageType::BUFFER,
+        v_input.gpu_memory_layout(),
+    };
+  }();
 
   check_storage_buffer_limit(v_input, "mean input");
   check_storage_buffer_limit(v_output_buffer, "mean output");
@@ -449,11 +458,14 @@ Tensor mean_dim(
         output_dtype);
   }
 
-  vTensor v_output{
-      context,
-      output_size,
-      output_dtype,
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::ReductionOutput);
+    return vTensor{
+        context,
+        output_size,
+        output_dtype,
+    };
+  }();
 
   // Create the params buffer
   const struct Block final {
