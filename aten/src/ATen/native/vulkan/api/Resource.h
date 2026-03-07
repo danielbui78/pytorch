@@ -33,6 +33,35 @@ enum MemoryAccessType : MemoryAccessFlags {
   WRITE = 1u << 1u,
 };
 
+enum class AllocationTag : uint8_t {
+  Unknown = 0u,
+  LinearOutput,
+  LinearPackInput,
+  LinearPackWeight,
+  BiasTemp,
+  Staging,
+  MetadataUniform,
+  CopyTemp,
+};
+
+const char* allocation_tag_name(AllocationTag tag);
+
+class AllocationTagScope final {
+ public:
+  explicit AllocationTagScope(AllocationTag tag);
+
+  AllocationTagScope(const AllocationTagScope&) = delete;
+  AllocationTagScope& operator=(const AllocationTagScope&) = delete;
+
+  AllocationTagScope(AllocationTagScope&&) = delete;
+  AllocationTagScope& operator=(AllocationTagScope&&) = delete;
+
+  ~AllocationTagScope();
+
+ private:
+  AllocationTag previous_tag_;
+};
+
 struct MemoryBarrier final {
   VkMemoryBarrier handle;
 
@@ -111,6 +140,8 @@ class VulkanBuffer final {
   // Indicates whether the underlying memory is owned by this resource
   bool owns_memory_;
   VkBuffer handle_;
+  uint64_t tracked_alloc_size_;
+  AllocationTag allocation_tag_;
 
  public:
   inline VkDevice device() const {
@@ -313,6 +344,8 @@ class VulkanImage final {
   Handles handles_;
   // Layout
   VkImageLayout layout_;
+  uint64_t tracked_alloc_size_;
+  AllocationTag allocation_tag_;
 
  public:
   void create_image_view();

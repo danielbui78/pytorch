@@ -622,6 +622,7 @@ vTensor pack_inputs_using_width_packing(const Tensor& input_arg) {
   vTensor v_input = convert(input);
   if (v_input.gpu_memory_layout() ==
       api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED) {
+    api::AllocationTagScope tag_scope(api::AllocationTag::LinearPackInput);
     v_input = packing::convert_image_channels_packed_to_width_packed(v_input);
   }
 
@@ -654,6 +655,7 @@ vTensor pack_weights_using_height_packing(const Tensor& weight_arg) {
   vTensor v_weight = convert(weight);
   if (v_weight.gpu_memory_layout() ==
       api::GPUMemoryLayout::TENSOR_CHANNELS_PACKED) {
+    api::AllocationTagScope tag_scope(api::AllocationTag::LinearPackWeight);
     v_weight =
         packing::convert_image_channels_packed_to_height_packed(v_weight);
   }
@@ -1057,14 +1059,17 @@ Tensor run_quantized_addmm_context(
       (packed_v_weight.is_quantized() && v_input.is_quantized()),
       "run_quantized_addmm_context called for quantized version with unquantized input");
 
-  vTensor v_output{
-      context,
-      {
-          input_arg_2d.sizes()[Layout::Parameter::height],
-          unpacked_weight_sizes[Layout::Parameter::width],
-      },
-      v_input.dtype(),
-  };
+  vTensor v_output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::LinearOutput);
+    return vTensor{
+        context,
+        {
+            input_arg_2d.sizes()[Layout::Parameter::height],
+            unpacked_weight_sizes[Layout::Parameter::width],
+        },
+        v_input.dtype(),
+    };
+  }();
 
   v_output.set_is_quantized();
   v_output.set_scale(output_scale);
@@ -1221,7 +1226,10 @@ Tensor run_quantized_addmm_context(
         // params buffer
         params.buffer());
   }
-  Tensor output = convert(v_output);
+  Tensor output = [&]() {
+    api::AllocationTagScope tag_scope(api::AllocationTag::CopyTemp);
+    return convert(v_output);
+  }();
   if (input_arg.dim() == 2) {
     return output;
   } else {
@@ -1799,8 +1807,10 @@ Tensor run_addmm_context(
         std::fflush(stderr);
     }
     if (arith_mode == AddmmOutputArithmeticMode::Default) {
+        api::AllocationTagScope bias_scope(api::AllocationTag::BiasTemp);
         output = output.mul(alpha).add(convert(packed_v_bias).mul(beta));
     } else if (arith_mode == AddmmOutputArithmeticMode::SkipOutputMul) {
+        api::AllocationTagScope bias_scope(api::AllocationTag::BiasTemp);
         output = output.add(convert(packed_v_bias).mul(beta));
     } else if (arith_mode == AddmmOutputArithmeticMode::SkipBiasAdd) {
         output = output.mul(alpha);

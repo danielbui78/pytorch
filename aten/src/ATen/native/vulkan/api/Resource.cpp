@@ -2,11 +2,20 @@
 #include <ATen/native/vulkan/api/Context.h>
 #include <ATen/native/vulkan/api/Resource.h>
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <mutex>
 
 namespace {
+
+using ::at::native::vulkan::api::AllocationTag;
+
+constexpr size_t kAllocationTagCount =
+    static_cast<size_t>(AllocationTag::CopyTemp) + 1u;
+
+thread_local AllocationTag tls_allocation_tag = AllocationTag::Unknown;
 
 bool alloc_diagnostics_enabled() {
   const char* env = std::getenv("TORCH_VULKAN_ALLOC_DIAGNOSTICS");
@@ -30,6 +39,159 @@ bool alloc_budget_diagnostics_enabled() {
     return true;
   }
   return false;
+}
+
+bool alloc_attribution_diagnostics_enabled() {
+  const char* env = std::getenv("TORCH_VULKAN_ALLOC_ATTRIBUTION_DIAGNOSTICS");
+  if (!env || env[0] == '\0') {
+    return false;
+  }
+  if (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' ||
+      env[0] == 'Y') {
+    return true;
+  }
+  return false;
+}
+
+enum class AllocationKind : uint8_t {
+  Buffer = 0u,
+  Image = 1u,
+};
+
+struct AllocationTagStats final {
+  uint64_t live_bytes = 0ull;
+  uint64_t peak_live_bytes = 0ull;
+  uint64_t total_alloc_bytes = 0ull;
+  uint64_t live_count = 0ull;
+  uint64_t peak_live_count = 0ull;
+  uint64_t total_alloc_count = 0ull;
+};
+
+struct AllocationAttributionState final {
+  std::mutex mutex;
+  bool registered_atexit = false;
+  std::array<AllocationTagStats, kAllocationTagCount> buffer{};
+  std::array<AllocationTagStats, kAllocationTagCount> image{};
+};
+
+AllocationAttributionState& allocation_attribution_state() {
+  static AllocationAttributionState state{};
+  return state;
+}
+
+AllocationTagStats& allocation_stats_for(
+    AllocationAttributionState& state,
+    const AllocationKind kind,
+    const AllocationTag tag) {
+  const size_t index = static_cast<size_t>(tag);
+  return AllocationKind::Image == kind ? state.image[index] : state.buffer[index];
+}
+
+const char* allocation_kind_name(const AllocationKind kind) {
+  return AllocationKind::Image == kind ? "image" : "buffer";
+}
+
+void dump_allocation_attribution_summary() {
+  if (!alloc_attribution_diagnostics_enabled()) {
+    return;
+  }
+
+  AllocationAttributionState& state = allocation_attribution_state();
+  std::lock_guard<std::mutex> guard(state.mutex);
+
+  for (const AllocationKind kind : {AllocationKind::Buffer, AllocationKind::Image}) {
+    for (size_t index = 0; index < kAllocationTagCount; ++index) {
+      const AllocationTag tag = static_cast<AllocationTag>(index);
+      const AllocationTagStats& stats = allocation_stats_for(state, kind, tag);
+      if (0ull == stats.total_alloc_count && 0ull == stats.peak_live_bytes) {
+        continue;
+      }
+      std::fprintf(
+          stderr,
+          "[vulkan_alloc_summary] kind=%s tag=%s total_alloc_count=%llu total_alloc_bytes=%llu peak_live_count=%llu peak_live_bytes=%llu live_count=%llu live_bytes=%llu\n",
+          allocation_kind_name(kind),
+          ::at::native::vulkan::api::allocation_tag_name(tag),
+          static_cast<unsigned long long>(stats.total_alloc_count),
+          static_cast<unsigned long long>(stats.total_alloc_bytes),
+          static_cast<unsigned long long>(stats.peak_live_count),
+          static_cast<unsigned long long>(stats.peak_live_bytes),
+          static_cast<unsigned long long>(stats.live_count),
+          static_cast<unsigned long long>(stats.live_bytes));
+    }
+  }
+}
+
+void maybe_register_allocation_attribution_summary() {
+  if (!alloc_attribution_diagnostics_enabled()) {
+    return;
+  }
+
+  AllocationAttributionState& state = allocation_attribution_state();
+  std::lock_guard<std::mutex> guard(state.mutex);
+  if (!state.registered_atexit) {
+    std::atexit(dump_allocation_attribution_summary);
+    state.registered_atexit = true;
+  }
+}
+
+void record_allocation_attribution(
+    const AllocationKind kind,
+    const AllocationTag tag,
+    const uint64_t request_bytes,
+    const uint64_t alloc_bytes) {
+  if (!alloc_attribution_diagnostics_enabled()) {
+    return;
+  }
+
+  maybe_register_allocation_attribution_summary();
+
+  AllocationAttributionState& state = allocation_attribution_state();
+  std::lock_guard<std::mutex> guard(state.mutex);
+  AllocationTagStats& stats = allocation_stats_for(state, kind, tag);
+  stats.total_alloc_count += 1u;
+  stats.total_alloc_bytes += alloc_bytes;
+  stats.live_count += 1u;
+  stats.live_bytes += alloc_bytes;
+  if (stats.live_count > stats.peak_live_count) {
+    stats.peak_live_count = stats.live_count;
+  }
+  if (stats.live_bytes > stats.peak_live_bytes) {
+    stats.peak_live_bytes = stats.live_bytes;
+  }
+  std::fprintf(
+      stderr,
+      "[vulkan_alloc_attribution] event=alloc kind=%s tag=%s request=%llu alloc_size=%llu live_count=%llu live_bytes=%llu peak_live_bytes=%llu\n",
+      allocation_kind_name(kind),
+      ::at::native::vulkan::api::allocation_tag_name(tag),
+      static_cast<unsigned long long>(request_bytes),
+      static_cast<unsigned long long>(alloc_bytes),
+      static_cast<unsigned long long>(stats.live_count),
+      static_cast<unsigned long long>(stats.live_bytes),
+      static_cast<unsigned long long>(stats.peak_live_bytes));
+}
+
+void release_allocation_attribution(
+    const AllocationKind kind,
+    const AllocationTag tag,
+    const uint64_t alloc_bytes) {
+  if (!alloc_attribution_diagnostics_enabled() || 0ull == alloc_bytes) {
+    return;
+  }
+
+  AllocationAttributionState& state = allocation_attribution_state();
+  std::lock_guard<std::mutex> guard(state.mutex);
+  AllocationTagStats& stats = allocation_stats_for(state, kind, tag);
+  stats.live_count = stats.live_count > 0ull ? stats.live_count - 1ull : 0ull;
+  stats.live_bytes =
+      stats.live_bytes > alloc_bytes ? (stats.live_bytes - alloc_bytes) : 0ull;
+  std::fprintf(
+      stderr,
+      "[vulkan_alloc_attribution] event=free kind=%s tag=%s alloc_size=%llu live_count=%llu live_bytes=%llu\n",
+      allocation_kind_name(kind),
+      ::at::native::vulkan::api::allocation_tag_name(tag),
+      static_cast<unsigned long long>(alloc_bytes),
+      static_cast<unsigned long long>(stats.live_count),
+      static_cast<unsigned long long>(stats.live_bytes));
 }
 
 struct BudgetSummary final {
@@ -305,6 +467,37 @@ namespace native {
 namespace vulkan {
 namespace api {
 
+const char* allocation_tag_name(const AllocationTag tag) {
+  switch (tag) {
+    case AllocationTag::Unknown:
+      return "unknown";
+    case AllocationTag::LinearOutput:
+      return "linear_output";
+    case AllocationTag::LinearPackInput:
+      return "linear_pack_input";
+    case AllocationTag::LinearPackWeight:
+      return "linear_pack_weight";
+    case AllocationTag::BiasTemp:
+      return "bias_temp";
+    case AllocationTag::Staging:
+      return "staging";
+    case AllocationTag::MetadataUniform:
+      return "metadata_uniform";
+    case AllocationTag::CopyTemp:
+      return "copy_temp";
+  }
+  return "unknown";
+}
+
+AllocationTagScope::AllocationTagScope(const AllocationTag tag)
+    : previous_tag_(tls_allocation_tag) {
+  tls_allocation_tag = tag;
+}
+
+AllocationTagScope::~AllocationTagScope() {
+  tls_allocation_tag = previous_tag_;
+}
+
 //
 // MemoryBarrier
 //
@@ -378,7 +571,9 @@ VulkanBuffer::VulkanBuffer()
       allocator_(VK_NULL_HANDLE),
       memory_{},
       owns_memory_(false),
-      handle_(VK_NULL_HANDLE) {}
+      handle_(VK_NULL_HANDLE),
+      tracked_alloc_size_(0ull),
+      allocation_tag_(AllocationTag::Unknown) {}
 
 VulkanBuffer::VulkanBuffer(
     VmaAllocator vma_allocator,
@@ -395,7 +590,9 @@ VulkanBuffer::VulkanBuffer(
       allocator_(vma_allocator),
       memory_{},
       owns_memory_(allocate_memory),
-      handle_(VK_NULL_HANDLE) {
+      handle_(VK_NULL_HANDLE),
+      tracked_alloc_size_(0ull),
+      allocation_tag_(tls_allocation_tag) {
   // Only allocate memory if the buffer has non-zero size
   if (size == 0) {
     return;
@@ -460,19 +657,31 @@ VulkanBuffer::VulkanBuffer(
     if (alloc_diagnostics_enabled()) {
       VmaAllocationInfo alloc_info{};
       vmaGetAllocationInfo(allocator_, memory_.allocation, &alloc_info);
+      tracked_alloc_size_ = static_cast<uint64_t>(alloc_info.size);
       const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
       vmaGetMemoryProperties(allocator_, &mem_props);
       const VkMemoryPropertyFlags flags =
           mem_props->memoryTypes[alloc_info.memoryType].propertyFlags;
       std::fprintf(
           stdout,
-          "[vulkan_alloc] buffer size=%llu alloc_size=%llu type=%u flags=0x%x usage=0x%x\n",
+          "[vulkan_alloc] buffer size=%llu alloc_size=%llu type=%u flags=0x%x usage=0x%x tag=%s\n",
           static_cast<unsigned long long>(buffer_properties_.size),
           static_cast<unsigned long long>(alloc_info.size),
           alloc_info.memoryType,
           static_cast<unsigned int>(flags),
-          static_cast<unsigned int>(buffer_properties_.buffer_usage));
+          static_cast<unsigned int>(buffer_properties_.buffer_usage),
+          allocation_tag_name(allocation_tag_));
+    } else if (alloc_attribution_diagnostics_enabled()) {
+      VmaAllocationInfo alloc_info{};
+      vmaGetAllocationInfo(allocator_, memory_.allocation, &alloc_info);
+      tracked_alloc_size_ = static_cast<uint64_t>(alloc_info.size);
     }
+
+    record_allocation_attribution(
+        AllocationKind::Buffer,
+        allocation_tag_,
+        static_cast<uint64_t>(buffer_properties_.size),
+        tracked_alloc_size_);
   } else {
     VmaAllocatorInfo allocator_info{};
     vmaGetAllocatorInfo(allocator_, &allocator_info);
@@ -486,8 +695,12 @@ VulkanBuffer::VulkanBuffer(VulkanBuffer&& other) noexcept
       allocator_(other.allocator_),
       memory_(std::move(other.memory_)),
       owns_memory_(other.owns_memory_),
-      handle_(other.handle_) {
+      handle_(other.handle_),
+      tracked_alloc_size_(other.tracked_alloc_size_),
+      allocation_tag_(other.allocation_tag_) {
   other.handle_ = VK_NULL_HANDLE;
+  other.tracked_alloc_size_ = 0ull;
+  other.allocation_tag_ = AllocationTag::Unknown;
 }
 
 VulkanBuffer& VulkanBuffer::operator=(VulkanBuffer&& other) noexcept {
@@ -499,15 +712,21 @@ VulkanBuffer& VulkanBuffer::operator=(VulkanBuffer&& other) noexcept {
   memory_ = std::move(other.memory_);
   owns_memory_ = other.owns_memory_;
   handle_ = other.handle_;
+  tracked_alloc_size_ = other.tracked_alloc_size_;
+  allocation_tag_ = other.allocation_tag_;
 
   other.handle_ = tmp_buffer;
   other.owns_memory_ = tmp_owns_memory;
+  other.tracked_alloc_size_ = 0ull;
+  other.allocation_tag_ = AllocationTag::Unknown;
 
   return *this;
 }
 
 VulkanBuffer::~VulkanBuffer() {
   if (VK_NULL_HANDLE != handle_) {
+    release_allocation_attribution(
+        AllocationKind::Buffer, allocation_tag_, tracked_alloc_size_);
     if (owns_memory_) {
       vmaDestroyBuffer(allocator_, handle_, memory_.allocation);
     } else {
@@ -691,7 +910,9 @@ VulkanImage::VulkanImage()
           VK_NULL_HANDLE,
           VK_NULL_HANDLE,
       },
-      layout_{} {}
+      layout_{},
+      tracked_alloc_size_(0ull),
+      allocation_tag_(AllocationTag::Unknown) {}
 
 VulkanImage::VulkanImage(
     VmaAllocator vma_allocator,
@@ -713,7 +934,9 @@ VulkanImage::VulkanImage(
           VK_NULL_HANDLE,
           sampler,
       },
-      layout_(layout) {
+      layout_(layout),
+      tracked_alloc_size_(0ull),
+      allocation_tag_(tls_allocation_tag) {
   VmaAllocatorInfo allocator_info{};
   vmaGetAllocatorInfo(allocator_, &allocator_info);
 
@@ -793,6 +1016,33 @@ VulkanImage::VulkanImage(
           image_properties_.image_extents);
     }
     VK_CHECK(alloc_result);
+    VmaAllocationInfo alloc_info{};
+    vmaGetAllocationInfo(allocator_, memory_.allocation, &alloc_info);
+    tracked_alloc_size_ = static_cast<uint64_t>(alloc_info.size);
+    if (alloc_diagnostics_enabled() || alloc_attribution_diagnostics_enabled()) {
+      const VkPhysicalDeviceMemoryProperties* mem_props = nullptr;
+      vmaGetMemoryProperties(allocator_, &mem_props);
+      const VkMemoryPropertyFlags flags =
+          mem_props->memoryTypes[alloc_info.memoryType].propertyFlags;
+      std::fprintf(
+          stdout,
+          "[vulkan_alloc] image request=%llu alloc_size=%llu type=%u flags=0x%x usage=0x%x extent=%ux%ux%u format=%u tag=%s\n",
+          static_cast<unsigned long long>(request_bytes),
+          static_cast<unsigned long long>(alloc_info.size),
+          alloc_info.memoryType,
+          static_cast<unsigned int>(flags),
+          static_cast<unsigned int>(image_properties_.image_usage),
+          static_cast<unsigned int>(image_properties_.image_extents.width),
+          static_cast<unsigned int>(image_properties_.image_extents.height),
+          static_cast<unsigned int>(image_properties_.image_extents.depth),
+          static_cast<unsigned int>(image_properties_.image_format),
+          allocation_tag_name(allocation_tag_));
+    }
+    record_allocation_attribution(
+        AllocationKind::Image,
+        allocation_tag_,
+        request_bytes,
+        tracked_alloc_size_);
     // Only create the image view if the image has been bound to memory
     create_image_view();
   } else {
@@ -809,11 +1059,15 @@ VulkanImage::VulkanImage(VulkanImage&& other) noexcept
       memory_(std::move(other.memory_)),
       owns_memory_(other.owns_memory_),
       handles_(other.handles_),
-      layout_(other.layout_) {
+      layout_(other.layout_),
+      tracked_alloc_size_(other.tracked_alloc_size_),
+      allocation_tag_(other.allocation_tag_) {
   other.handles_.image = VK_NULL_HANDLE;
   other.handles_.image_view = VK_NULL_HANDLE;
   other.handles_.sampler = VK_NULL_HANDLE;
   other.owns_memory_ = false;
+  other.tracked_alloc_size_ = 0ull;
+  other.allocation_tag_ = AllocationTag::Unknown;
 }
 
 VulkanImage& VulkanImage::operator=(VulkanImage&& other) noexcept {
@@ -829,10 +1083,14 @@ VulkanImage& VulkanImage::operator=(VulkanImage&& other) noexcept {
   owns_memory_ = other.owns_memory_;
   handles_ = other.handles_;
   layout_ = other.layout_;
+  tracked_alloc_size_ = other.tracked_alloc_size_;
+  allocation_tag_ = other.allocation_tag_;
 
   other.handles_.image = tmp_image;
   other.handles_.image_view = tmp_image_view;
   other.owns_memory_ = tmp_owns_memory;
+  other.tracked_alloc_size_ = 0ull;
+  other.allocation_tag_ = AllocationTag::Unknown;
 
   return *this;
 }
@@ -843,6 +1101,8 @@ VulkanImage::~VulkanImage() {
   }
 
   if (VK_NULL_HANDLE != handles_.image) {
+    release_allocation_attribution(
+        AllocationKind::Image, allocation_tag_, tracked_alloc_size_);
     if (owns_memory_) {
       vmaDestroyImage(allocator_, handles_.image, memory_.allocation);
     } else {
@@ -1113,11 +1373,18 @@ VulkanBuffer MemoryAllocator::create_storage_buffer(
         VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
   }
 
+  if (!gpu_only && tls_allocation_tag == AllocationTag::Unknown) {
+    AllocationTagScope tag_scope(AllocationTag::Staging);
+    return VulkanBuffer(
+        allocator_, size, alloc_create_info, buffer_usage, allocate_memory);
+  }
+
   return VulkanBuffer(
       allocator_, size, alloc_create_info, buffer_usage, allocate_memory);
 }
 
 VulkanBuffer MemoryAllocator::create_staging_buffer(const VkDeviceSize size) {
+  AllocationTagScope tag_scope(AllocationTag::Staging);
   VmaAllocationCreateInfo alloc_create_info = {};
   alloc_create_info.flags = DEFAULT_ALLOCATION_STRATEGY;
   alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -1129,6 +1396,7 @@ VulkanBuffer MemoryAllocator::create_staging_buffer(const VkDeviceSize size) {
 }
 
 VulkanBuffer MemoryAllocator::create_uniform_buffer(const VkDeviceSize size) {
+  AllocationTagScope tag_scope(AllocationTag::MetadataUniform);
   VmaAllocationCreateInfo alloc_create_info = {};
   alloc_create_info.flags = DEFAULT_ALLOCATION_STRATEGY |
       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
