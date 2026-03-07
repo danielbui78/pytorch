@@ -8,6 +8,42 @@ namespace native {
 namespace vulkan {
 namespace ops {
 
+namespace {
+
+api::AllocationTag classify_view_output_tag(
+    const IntArrayRef input_sizes,
+    const IntArrayRef output_sizes) {
+  if (
+      input_sizes.size() == 3u && output_sizes.size() == 4u &&
+      output_sizes[0] == input_sizes[0] &&
+      output_sizes[1] == input_sizes[1] &&
+      output_sizes[2] > 0 && output_sizes[3] > 0 &&
+      output_sizes[2] * output_sizes[3] == input_sizes[2]) {
+    return api::AllocationTag::ViewSplitHeadsOutput;
+  }
+
+  if (
+      input_sizes.size() == 4u && output_sizes.size() == 3u &&
+      output_sizes[0] == input_sizes[0] &&
+      output_sizes[1] == input_sizes[1] &&
+      input_sizes[2] > 0 && input_sizes[3] > 0 &&
+      input_sizes[2] * input_sizes[3] == output_sizes[2]) {
+    return api::AllocationTag::ViewMergeHeadsOutput;
+  }
+
+  if (
+      output_sizes.size() == 2u && !input_sizes.empty() &&
+      output_sizes[1] == input_sizes.back() &&
+      api::utils::multiply_integers(output_sizes) ==
+          api::utils::multiply_integers(input_sizes)) {
+    return api::AllocationTag::ViewFlattenOutput;
+  }
+
+  return api::AllocationTag::ViewOutput;
+}
+
+} // namespace
+
 static Tensor view_internal(const Tensor& self_arg, const IntArrayRef shape) {
   api::Context* const context = api::context();
 
@@ -17,7 +53,8 @@ static Tensor view_internal(const Tensor& self_arg, const IntArrayRef shape) {
   at::DimVector inferred_size = at::infer_size_dv(shape, self.numel());
   IntArrayRef output_size(inferred_size);
 
-  api::AllocationTagScope tag_scope(api::AllocationTag::ViewOutput);
+  api::AllocationTagScope tag_scope(
+      classify_view_output_tag(v_self.sizes(), inferred_size));
   vTensor v_output{
       context,
       output_size.vec(),

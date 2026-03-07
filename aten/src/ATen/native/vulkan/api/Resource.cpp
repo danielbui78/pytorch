@@ -487,6 +487,12 @@ const char* allocation_tag_name(const AllocationTag tag) {
       return "factory_output";
     case AllocationTag::ViewOutput:
       return "view_output";
+    case AllocationTag::ViewFlattenOutput:
+      return "view_flatten_output";
+    case AllocationTag::ViewSplitHeadsOutput:
+      return "view_split_heads_output";
+    case AllocationTag::ViewMergeHeadsOutput:
+      return "view_merge_heads_output";
     case AllocationTag::IndexingOutput:
       return "indexing_output";
     case AllocationTag::LayoutOutput:
