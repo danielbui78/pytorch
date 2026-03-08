@@ -109,6 +109,8 @@ Tensor run_qlinear_context(
     int64_t output_zero_point,
     const c10::intrusive_ptr<LinearPackedContext>& context);
 
+Tensor matmul(const Tensor& mat1_arg, const Tensor& mat2_arg);
+
 } // namespace ops
 } // namespace vulkan
 } // namespace native

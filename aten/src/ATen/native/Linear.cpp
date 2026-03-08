@@ -28,6 +28,7 @@
 #include <ATen/ops/mkldnn_linear.h>
 #include <ATen/ops/mm.h>
 #include <ATen/ops/mul.h>
+#include <ATen/ops/stack.h>
 #include <ATen/ops/tensordot_native.h>
 #include <ATen/ops/zeros.h>
 #endif
@@ -52,6 +53,51 @@ static inline bool parseLinearFlatten3d() {
 
 static bool vulkanLinearPathTraceEnabled() {
   const char* const value = std::getenv("PYTORCH_VULKAN_LINEAR_PATH_TRACE");
+  if (nullptr == value) {
+    return false;
+  }
+
+  return
+      0 == std::strcmp(value, "1") ||
+      0 == std::strcmp(value, "true") ||
+      0 == std::strcmp(value, "TRUE") ||
+      0 == std::strcmp(value, "on") ||
+      0 == std::strcmp(value, "ON");
+}
+
+static bool vulkanLinear3dMatmulBypassEnabled() {
+  const char* const value =
+      std::getenv("PYTORCH_VULKAN_LINEAR_3D_MATMUL_BYPASS");
+  if (nullptr == value) {
+    return false;
+  }
+
+  return
+      0 == std::strcmp(value, "1") ||
+      0 == std::strcmp(value, "true") ||
+      0 == std::strcmp(value, "TRUE") ||
+      0 == std::strcmp(value, "on") ||
+      0 == std::strcmp(value, "ON");
+}
+
+static bool vulkanLinear3dBmmExpandBypassEnabled() {
+  const char* const value =
+      std::getenv("PYTORCH_VULKAN_LINEAR_3D_BMM_EXPAND_BYPASS");
+  if (nullptr == value) {
+    return false;
+  }
+
+  return
+      0 == std::strcmp(value, "1") ||
+      0 == std::strcmp(value, "true") ||
+      0 == std::strcmp(value, "TRUE") ||
+      0 == std::strcmp(value, "on") ||
+      0 == std::strcmp(value, "ON");
+}
+
+static bool vulkanLinear3dMmLoopBypassEnabled() {
+  const char* const value =
+      std::getenv("PYTORCH_VULKAN_LINEAR_3D_MM_LOOP_BYPASS");
   if (nullptr == value) {
     return false;
   }
@@ -180,6 +226,90 @@ Tensor linear(const Tensor& input, const Tensor& weight, const std::optional<Ten
   if (input_dim == 2 && bias->defined()) {
     // Fused op is marginally faster.
     return at::addmm(*bias, input, weight.t());
+  }
+
+  if (
+      vulkanLinear3dMmLoopBypassEnabled() &&
+      input.is_vulkan() &&
+      weight.is_vulkan() &&
+      input_dim == 3 &&
+      weight_dim == 2 &&
+      weight.layout() == c10::kStrided &&
+      input.is_contiguous_or_false() &&
+      (!bias->defined() || bias->is_vulkan())) {
+    traceVulkanLinearPath(
+        "linear_choose_vulkan_3d_mm_loop_bypass",
+        input,
+        weight,
+        bias_ptr);
+    std::vector<Tensor> outputs;
+    outputs.reserve(input.size(0));
+    const auto weight_t = weight.t();
+    for (const auto i : c10::irange(input.size(0))) {
+      outputs.push_back(at::mm(input.select(0, i), weight_t));
+    }
+    auto output = at::stack(outputs, 0);
+    if (bias->defined()) {
+      if (isTensorSubclassLike(*bias) ||
+          bias->_fw_grad(/*level*/ 0).defined()) {
+        output = at::add(output, *bias);
+      } else {
+        output.add_(*bias);
+      }
+    }
+    return output;
+  }
+
+  if (
+      vulkanLinear3dBmmExpandBypassEnabled() &&
+      input.is_vulkan() &&
+      input_dim == 3 &&
+      weight_dim == 2 &&
+      weight.layout() == c10::kStrided &&
+      input.is_contiguous_or_false()) {
+    traceVulkanLinearPath(
+        "linear_choose_vulkan_3d_bmm_repeat_bypass",
+        input,
+        weight,
+        bias_ptr);
+    const auto batch = input.size(0);
+    const auto weight_vulkan = weight.is_vulkan() ? weight : weight.vulkan();
+    const auto weight_t_batched =
+        weight_vulkan.t().unsqueeze(0).repeat({batch, 1, 1});
+    auto output = at::bmm(input, weight_t_batched);
+    if (bias->defined()) {
+      if (isTensorSubclassLike(*bias) ||
+          bias->_fw_grad(/*level*/ 0).defined()) {
+        output = at::add(output, *bias);
+      } else {
+        output.add_(*bias);
+      }
+    }
+    return output;
+  }
+
+  if (
+      vulkanLinear3dMatmulBypassEnabled() &&
+      input.is_vulkan() &&
+      input_dim == 3 &&
+      weight_dim == 2 &&
+      weight.layout() == c10::kStrided &&
+      input.is_contiguous_or_false()) {
+    traceVulkanLinearPath(
+        "linear_choose_vulkan_3d_matmul_bypass",
+        input,
+        weight,
+        bias_ptr);
+    auto output = at::matmul(input, weight.t().vulkan());
+    if (bias->defined()) {
+      if (isTensorSubclassLike(*bias) ||
+          bias->_fw_grad(/*level*/ 0).defined()) {
+        output = at::add(output, *bias);
+      } else {
+        output.add_(*bias);
+      }
+    }
+    return output;
   }
 
   const auto is_bias_likely_fusable = (

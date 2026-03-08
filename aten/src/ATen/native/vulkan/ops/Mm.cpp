@@ -1516,6 +1516,12 @@ Tensor run_addmm_buffer(
   return convert(v_output);
 }
 
+inline bool linear_3d_matmul_bypass_enabled() {
+  const char* env =
+      std::getenv("PYTORCH_VULKAN_LINEAR_3D_MATMUL_BYPASS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 Tensor run_baddbmm_buffer(
     const Tensor& input_arg,
     const Tensor& weight_arg,
@@ -2050,6 +2056,91 @@ Tensor run_baddbmm_context(
   return mm_output.mul(alpha).add(scaled_bias);
 }
 
+Tensor run_bmm_shared_weight_context(
+    const Tensor& input_arg,
+    const Tensor& weight_arg) {
+  api::Context* const context = api::context();
+
+  TORCH_CHECK(
+      input_arg.dim() == 3,
+      "Vulkan matmul(3d, 2d) expects a rank-3 input tensor.");
+  TORCH_CHECK(
+      weight_arg.dim() == 2,
+      "Vulkan matmul(3d, 2d) expects a rank-2 weight tensor.");
+
+  const Tensor input = input_arg.is_vulkan() ? input_arg : input_arg.vulkan();
+  const Tensor weight =
+      weight_arg.is_vulkan() ? weight_arg : weight_arg.vulkan();
+
+  vTensor packed_v_input = pack_inputs_using_width_packing(input);
+  const vTensor packed_v_weight = pack_weights_using_height_packing(weight);
+
+  TORCH_CHECK(
+      packed_v_input.gpu_memory_layout() ==
+          api::GPUMemoryLayout::TENSOR_WIDTH_PACKED,
+      "Shared-weight batched matmul expects width-packed input.");
+  TORCH_CHECK(
+      packed_v_weight.gpu_memory_layout() ==
+          api::GPUMemoryLayout::TENSOR_HEIGHT_PACKED,
+      "Shared-weight batched matmul expects height-packed weight.");
+
+  TORCH_CHECK(
+      input.size(Layout::BatchMatrices::width) ==
+          weight.size(Layout::Parameter::height),
+      "Vulkan matmul(3d, 2d) dimension mismatch.");
+
+  const int64_t input_batch =
+      packed_v_input.sizes()[Layout::BatchMatrices::batch];
+  const int64_t input_width =
+      packed_v_input.sizes()[Layout::BatchMatrices::width];
+  const int64_t mm_step_size = div_up(input_width, INT64_C(4));
+
+  vTensor v_output{
+      context,
+      {
+          input_batch * 4,
+          packed_v_input.sizes()[Layout::BatchMatrices::height],
+          weight.size(Layout::Parameter::width),
+      },
+      packed_v_input.dtype(),
+  };
+
+  const struct {
+    uvec3 shader_extents;
+    uint32_t mm_step_size;
+  } block_no_bias{
+      v_output.extents(),
+      safe_downcast<uint32_t>(mm_step_size),
+  };
+
+  api::UniformParamsBuffer params(context, block_no_bias);
+  api::PipelineBarrier pipeline_barrier{};
+
+  context->submit_compute_job(
+      VK_KERNEL(mm_batch_weight_shared),
+      pipeline_barrier,
+      {
+          safe_downcast<uint32_t>(
+              div_up(v_output.sizes()[Layout::BatchMatrices::width], INT64_C(4))),
+          safe_downcast<uint32_t>(
+              div_up(v_output.sizes()[Layout::BatchMatrices::height], INT64_C(4))),
+          safe_downcast<uint32_t>(v_output.sizes()[Layout::BatchMatrices::batch]),
+      },
+      {8, 8, 1},
+      VK_NULL_HANDLE,
+      v_output.image(
+          pipeline_barrier,
+          api::PipelineStage::COMPUTE,
+          api::MemoryAccessType::WRITE),
+      packed_v_input.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      packed_v_weight.image(pipeline_barrier, api::PipelineStage::COMPUTE),
+      params.buffer());
+
+  auto mm_output_unpacked = convert(v_output);
+  return mm_output_unpacked.slice(
+      Layout::BatchMatrices::batch, 0, input_batch * 4, 4);
+}
+
 Tensor addmm(
     const Tensor& bias,
     const Tensor& input,
@@ -2301,12 +2392,26 @@ Tensor bmm(const Tensor& mat1_arg, const Tensor& mat2_arg) {
           mat2_arg, std::optional<Tensor>(), true /*use batch*/)));
 }
 
-Tensor matmul(const Tensor& mat1_arg, const Tensor& mat2_arg) {
+Tensor matmul_impl(const Tensor& mat1_arg, const Tensor& mat2_arg) {
   if (mat1_arg.dim() == 2 && mat2_arg.dim() == 2) {
     return ::at::native::vulkan::ops::mm(mat1_arg, mat2_arg);
   }
   if (mat1_arg.dim() == 3 && mat2_arg.dim() == 3) {
     return ::at::native::vulkan::ops::bmm(mat1_arg, mat2_arg);
+  }
+  if (
+      linear_3d_matmul_bypass_enabled() &&
+      mat1_arg.dim() == 3 &&
+      mat2_arg.dim() == 2) {
+    const Tensor mat1 = mat1_arg.is_vulkan() ? mat1_arg : mat1_arg.vulkan();
+    const Tensor mat2 = mat2_arg.is_vulkan() ? mat2_arg : mat2_arg.vulkan();
+    const vTensor& v_mat1 = convert(mat1);
+    const vTensor& v_mat2 = convert(mat2);
+
+    if (v_mat1.storage_type() == api::StorageType::TEXTURE_3D &&
+        v_mat2.storage_type() == api::StorageType::TEXTURE_3D) {
+      return run_bmm_shared_weight_context(mat1, mat2);
+    }
   }
 
   const Tensor mat1_cpu = mat1_arg.is_vulkan() ? mat1_arg.cpu() : mat1_arg;
@@ -2357,6 +2462,10 @@ TORCH_LIBRARY_IMPL(aten, Vulkan, m) {
 #endif /* USE_VULKAN_API */
 
 } // namespace
+
+Tensor matmul(const Tensor& mat1_arg, const Tensor& mat2_arg) {
+  return matmul_impl(mat1_arg, mat2_arg);
+}
 
 LinearPackedContext::LinearPackedContext(
     const Tensor& weight,

@@ -18,6 +18,9 @@
 #include <ATen/native/ReduceOps.h>
 #include <ATen/native/ReduceOpsUtils.h>
 #include <ATen/native/Resize.h>
+#ifdef USE_VULKAN_API
+#include <ATen/native/vulkan/ops/Mm.h>
+#endif
 #include <ATen/native/mkldnn/Matmul.h>
 #include <ATen/native/mkldnn/Utils.h>
 #include <ATen/cpu/Utils.h>
@@ -160,6 +163,16 @@
 #endif
 
 namespace at {
+
+namespace {
+
+static bool vulkanLinear3dMatmulBypassEnabled() {
+  static auto value =
+      c10::utils::check_env("PYTORCH_VULKAN_LINEAR_3D_MATMUL_BYPASS");
+  return value.has_value() && value.value();
+}
+
+} // namespace
 
 namespace detail {
   static void check_linalg_norm_dtype(std::optional<ScalarType> opt_dtype, ScalarType self_dtype, const char* const name) {
@@ -2043,6 +2056,16 @@ static Tensor _matmul_impl(
                    : tensor1.unsqueeze(0).mm(tensor2).squeeze_(0);
   } else if (dim_tensor1 == 2 && dim_tensor2 == 2) {
     return has_out ? at::mm_out(out, tensor1, tensor2) : tensor1.mm(tensor2);
+#ifdef USE_VULKAN_API
+  } else if (
+      vulkanLinear3dMatmulBypassEnabled() &&
+      !has_out &&
+      dim_tensor1 == 3 &&
+      dim_tensor2 == 2 &&
+      tensor1.is_vulkan() &&
+      tensor2.is_vulkan()) {
+    return at::native::vulkan::ops::matmul(tensor1, tensor2);
+#endif
   } else if (should_fold(tensor1, tensor2, has_out)) {
     // dim_tensor1 >=3 && (dim_tensor2 == 1 || dim_tensor2 == 2) ||
     // dim_tensor2 >=3 && (dim_tensor1 == 1 || dim_tensor1 == 2)
